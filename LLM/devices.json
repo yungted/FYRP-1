@@ -1,0 +1,48 @@
+{
+  "device_id": "pi-01",
+  "timestamp": "2025-11-12T13:56:01Z",
+  "inputs": [
+    {
+      "name": "button1",
+      "type": "digital",
+      "pin": 17,
+      "description": "user button A"
+    },
+    {
+      "name": "distance",
+      "type": "sensor",
+      "unit": "cm",
+      "description": "ultrasonic sensor"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "led",
+      "type": "digital",
+      "pin": 3,
+      "actions": [
+        "on",
+        "off",
+        "blink"
+      ]
+    },
+    {
+      "name": "buzzer",
+      "type": "buzzer",
+      "pin": 4,
+      "actions": [
+        "beep",
+        "sequence"
+      ]
+    },
+    {
+      "name": "servo1",
+      "type": "servo",
+      "pin": 17,
+      "angle_range": [
+        0,
+        180
+      ]
+    }
+  ]
+}
