@@ -1,26 +1,19 @@
-# test_tts.py
 from TTS.api import TTS
-import os
+import numpy as np
+import sounddevice as sd
 
-# --- Initialize TTS ---
-# This will download a default English model if not already downloaded
-tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=True, gpu=False)
+# Load VITS English model
+tts = TTS("tts_models/en/ljspeech/vits")
 
-# --- Text to Convert ---
-text = "Hello Rodney! This is a test of your local text-to-speech system using Python."
+def speak(text):
+    audio = tts.tts(text=text)
+    audio = np.array(audio, dtype=np.float32)
+    sd.play(audio, samplerate=tts.synthesizer.output_sample_rate)
+    sd.wait()
 
-# --- Output File ---
-output_file = "output.wav"
-
-# --- Generate Speech ---
-tts.tts_to_file(text=text, file_path=output_file)
-print(f"✅ Speech saved to {output_file}")
-
-# --- Play Audio ---
-try:
-    if os.name == "nt":  # Windows
-        os.system(f'start {output_file}')
-    else:
-        os.system(f'afplay {output_file}')  # macOS
-except Exception as e:
-    print(f"⚠️ Could not play audio automatically: {e}")
+if __name__ == "__main__":
+    while True:
+        msg = input("Say something: ")
+        if msg == "exit":
+            break
+        speak(msg)
