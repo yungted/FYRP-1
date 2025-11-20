@@ -1,17 +1,20 @@
-import moondream as md
-from PIL import Image
+import asyncio
+import edge_tts
 
-# Replace with your actual API key
-API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJrZXlfaWQiOiIxZWI5Njk0MS02MDVlLTQ3ZTYtYjI5NS01NjdjMGRjYWZhYTkiLCJvcmdfaWQiOiJlZzJ2bXo4a1FWY0xlOTExQVl5bkM0NU44YkhEYTMwTyIsImlhdCI6MTc2MjkzMzIzOSwidmVyIjoxfQ.onaMxtqh-X14ggd8XUDfiALxzYuHuUyI3GMbWHBYCqw"
+async def main():
+    # Set the voice to RyanNeural
+    voice = "en-US-RyanNeural"
+    
+    # Input text
+    text = "Hello, this is Ryan speaking locally using Edge TTS."
+    
+    # Output file
+    output_file = "ryan_local.mp3"
+    
+    # Create TTS object and save to file
+    communicator = edge_tts.Communicate(text, voice)
+    await communicator.save(output_file)
+    print(f"Saved synthesized speech to {output_file}")
 
-# Connect to the cloud
-model = md.vl(endpoint="https://api.moondream.ai/v1", api_key=API_KEY)
-
-# Load an image
-image_path = r"C:\Users\User\Downloads\images.jpeg"
-image = Image.open(image_path)
-
-# Query safely
-response = model.query(image, "What's in this image?")
-answer = response.get("answer", "No answer returned")
-print("Answer:", answer)
+# Run the async function
+asyncio.run(main())
