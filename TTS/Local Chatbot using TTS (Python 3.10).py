@@ -25,9 +25,9 @@ ollama_client = Client(host="https://ollama.com", headers={"Authorization": f"Be
 
 def ask_ollama(prompt: str) -> str:
     try:
-        system_message = "You are a helpful assistant. Always respond in short and concise sentences."
+        system_message = "You are a helpful assistant named Robert. Always respond in short and concise sentences."
         res = ollama_client.chat(
-            model="gpt-oss:120b-cloud",
+            model="deepseek-v3.1:671b-cloud",
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}

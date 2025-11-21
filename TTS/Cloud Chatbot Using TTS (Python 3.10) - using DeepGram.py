@@ -52,11 +52,11 @@ def deepgram_tts(text):
 # CLOUD LLM
 # =============================
 def ask_ollama(prompt: str) -> str:
-    system_message = "You are a helpful AI. Always reply concisely."
+    system_message = "You are a helpful AI named Robert. Always reply concisely."
 
     try:
         res = ollama_client.chat(
-            model="gpt-oss:120b-cloud",
+            model="deepseek-v3.1:671b-cloud",
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}

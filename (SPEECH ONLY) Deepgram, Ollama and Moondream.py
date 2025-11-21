@@ -150,7 +150,7 @@ def ask_ollama(prompt: str):
     system = build_system_message()
     try:
         res = ollama_client.chat(
-            model="gpt-oss:120b-cloud",
+            model="deepseek-v3.1:671b-cloud",
             messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
             stream=False
         )
