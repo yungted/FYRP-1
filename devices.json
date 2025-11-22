@@ -1,0 +1,73 @@
+{
+  "device_id": "pi-01",
+  "device_type": "raspberry_pi",
+  "timestamp": "2025-11-22T14:24:42Z",
+  "devices": [
+    {
+      "name": "LED",
+      "id": "led",
+      "type": "digital_output",
+      "pin": 3,
+      "actions": {
+        "on": {},
+        "off": {},
+        "blink": {
+          "parameters": {
+            "times": {
+              "type": "integer",
+              "default": 3
+            },
+            "delay": {
+              "type": "float",
+              "default": 0.3
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Buzzer",
+      "id": "buzzer",
+      "type": "buzzer_output",
+      "pin": 4,
+      "actions": {
+        "beep": {
+          "parameters": {
+            "frequency": {
+              "type": "float",
+              "default": 2000
+            },
+            "duration": {
+              "type": "float",
+              "default": 0.2
+            }
+          }
+        },
+        "sequence": {
+          "parameters": {
+            "tone_sequence": {
+              "type": "list"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Servo Motor",
+      "id": "servo",
+      "type": "servo",
+      "pin": 17,
+      "actions": {
+        "rotate": {
+          "parameters": {
+            "angle": {
+              "type": "float",
+              "min": 0,
+              "max": 180
+            }
+          }
+        }
+      }
+    }
+  ]
+}
