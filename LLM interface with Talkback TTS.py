@@ -36,7 +36,7 @@ MOONDREAM_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJrZXlfaWQiOiIxZWI5Njk0MS
 
 CAM_INDEX = 2  # Default webcam index
 WAKE_WORDS = ["hey robert", "hey, robert", "hi robert", "okay robert"]
-MQTT_BROKER = "192.168.0.165"
+MQTT_BROKER = "172.17.9.98"
 
 # Topics (subscribe to both legacy and MCP topics for compatibility)
 CONTROL_TOPIC = "robot/control"
@@ -319,21 +319,28 @@ def ask_ollama(user_text):
     device_list = load_devices_prompt()
     device_status = get_device_status_prompt()
     system_prompt = (
-        "You are Robert, a helpful intelligent assistant.\n"
-        "You have access to IoT devices and a camera.\n\n"
-        "DEVICE LIST (from devices.json):\n"
-        f"{device_list}\n\n"
-        "CURRENT DEVICE STATES (live telemetry):\n"
-        f"{device_status}\n\n"
-        "User Request Handling:\n"
-        "1. 'reply': A short, friendly verbal response for the user.\n"
-        "2. 'action': Either a single action object or a list of actions. Each action must be a JSON object containing 'mcp_action' and optional 'parameters'.\n\n"
-        "Action Schema Examples:\n"
-        "- Control Device: {\"mcp_action\":\"control_device\",\"parameters\":[{\"device\":\"LED\",\"state\":\"on\"}]}\n"
-        "- Delay: {\"mcp_action\":\"delay\",\"parameters\":[{\"duration_seconds\":3}]}\n"
-        "- Vision: {\"mcp_action\":\"capture_image\",\"parameters\":[{\"vision_prompt\":\"Count the fingers visible.\"}]}\n\n"
-        "IMPORTANT: Ensure 'device' fields match available device ids/names listed above. If multiple steps are needed, return 'action' as a list of action objects.\n"
-        "Example Response: {\"reply\":\"OK\",\"action\":[{\"mcp_action\":\"control_device\",\"parameters\":[{\"device\":\"LED\",\"state\":\"on\"}]},{\"mcp_action\":\"delay\",\"parameters\":[{\"duration_seconds\":3}]},{\"mcp_action\":\"control_device\",\"parameters\":[{\"device\":\"LED\",\"state\":\"off\"}]}]}"
+    "You are Robert, a helpful intelligent assistant.\n"
+    "You have access to IoT devices and a camera.\n\n"
+    "DEVICE LIST (from devices.json):\n"
+    f"{device_list}\n\n"
+    "CURRENT DEVICE STATES (live telemetry):\n"
+    f"{device_status}\n\n"
+    "User Request Handling:\n"
+    "1. 'reply': A short, friendly verbal response for the user.\n"
+    "2. 'action': Either a single action object or a list of actions. Each action must be a JSON object containing 'mcp_action' and optional 'parameters'.\n\n"
+    "For Vision/Camera requests, include 'vision_prompt' in the parameters to ask the camera a specific question based on user intent.\n\n"
+    "IMPORTANT:\n"
+    "- NEVER return 'state':'beep', 'action':'beep', or 'tone_sequence'.\n"
+    "- For buzzer control, ALWAYS use 'frequency': <Hz>, 'duration': <seconds>.\n"
+    "- For vision requests, generate a contextual 'vision_prompt' that best answers the user's question.\n"
+    "- Ensure 'device' fields match available device ids/names listed above.\n"
+    "- If multiple steps are needed, return 'action' as a list of action objects.\n"
+    "Example Vision Response:\n"
+    "{\"reply\":\"Let me look at that for you.\",\"action\":[{\"mcp_action\":\"capture_image\","
+    "\"parameters\":[{\"vision_prompt\":\"Count how many objects are visible in the image\"}]}]}\n"
+    "Example Response:\n"
+    "{\"reply\":\"OK\",\"action\":[{\"mcp_action\":\"control_device\","
+    "\"parameters\":[{\"device\":\"buzzer\",\"frequency\":440,\"duration\":0.5}]}]}"
     )
     try:
         res = ollama_client.chat(
@@ -368,25 +375,47 @@ def ask_ollama(user_text):
 async def handle_control_device(parameters):
     """
     parameters: list of parameter dicts, each with at least 'device' and associated action/state keys.
-    We'll validate each param and publish using publish_control_message().
+    Validates each param and publishes using publish_control_message().
+    Converts LLM-generated note formats to Pi-compatible tone_sequence format.
     """
     if not isinstance(parameters, list):
         print("⚠️ control_device parameters should be a list.")
         return
+
     for p in parameters:
         # Basic validation
         dev = p.get("device") or p.get("id")
         if not dev:
             print("⚠️ control parameter missing 'device':", p)
             continue
+
         # normalize device id
         p["device"] = str(dev).lower()
+
         # Validate against registry
         if not find_device_by_id(p["device"]):
             print(f"⚠️ Unknown device '{p['device']}' in control params, skipping.")
             continue
+
+        # Convert LLM "notes" format to Pi-compatible tone_sequence
+        if "notes" in p and isinstance(p["notes"], list):
+            tone_sequence = []
+            for note in p["notes"]:
+                if isinstance(note, dict):
+                    tone_sequence.append({
+                        "frequency_hz": note.get("freq", note.get("frequency", 2000)),
+                        "duration_s": note.get("duration", 0.5)
+                    })
+            if tone_sequence:
+                p["tone_sequence"] = tone_sequence
+            # Remove legacy keys to avoid conflicts
+            del p["notes"]
+            if "state" in p:
+                del p["state"]
+
     # Publish canonical MCP style (the Pi accepts this format)
     publish_control_message({"mcp_action": "control_device", "parameters": parameters})
+
 
 async def handle_delay(parameters):
     """
@@ -412,17 +441,22 @@ async def handle_delay(parameters):
         await asyncio.sleep(d)
 
 async def handle_capture_image(parameters):
-    # find first vision_prompt in parameters
+    """Handle vision/capture_image requests with LLM-generated prompts."""
+    # Extract vision_prompt from parameters (LLM-generated)
     prompt = None
     if isinstance(parameters, list):
         for p in parameters:
-            if p.get("vision_prompt"):
+            if isinstance(p, dict) and p.get("vision_prompt"):
                 prompt = p.get("vision_prompt")
                 break
     elif isinstance(parameters, dict):
         prompt = parameters.get("vision_prompt")
+    
+    # Fallback if no prompt provided
     if not prompt:
-        prompt = "Describe this image in detail."
+        prompt = "Describe what you see in detail."
+    
+    print(f"📸 Using vision prompt: {prompt}")
     description = await asyncio.to_thread(capture_and_analyze, prompt)
     await speak(f"I see {description}")
 
