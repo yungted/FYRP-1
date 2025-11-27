@@ -1,13 +1,13 @@
 {
   "device_id": "pi-01",
   "device_type": "raspberry_pi",
-  "timestamp": "2025-11-22T14:24:42Z",
+  "timestamp": "2025-11-27T05:57:04Z",
   "devices": [
     {
       "name": "LED",
       "id": "led",
       "type": "digital_output",
-      "pin": 3,
+      "pin": 27,
       "actions": {
         "on": {},
         "off": {},
