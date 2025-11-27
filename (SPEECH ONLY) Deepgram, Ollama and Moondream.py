@@ -37,7 +37,7 @@ command_buffer = ""
 DEVICES_FILE = "devices.json"
 
 # MQTT Setup
-MQTT_BROKER = "192.168.0.165"
+MQTT_BROKER = "10.171.14.150"
 CONTROL_TOPIC = "robot/control"
 STATUS_TOPIC = "robot/status"
 REQUEST_TOPIC = "robot/request"
