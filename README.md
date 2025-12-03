@@ -8,7 +8,7 @@ In this project, an intuitive HRI interface for a front-of-house greeting robot 
 3. Automatic Speech Recognition and Text-to-speech for Intuitive Interaction
 
 
-**APIs used**
+**APIs used:**
 ASR - https://deepgram.com/
 Scene Perception - https://moondream.ai/
 LLM - https://ollama.com/ (Model: GPT-120b)
