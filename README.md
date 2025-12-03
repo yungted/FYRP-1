@@ -1,4 +1,4 @@
-# FYRP-1
+# Sem 2 2025 FYRP-1
 **Intuitive Human-Robot Interaction for Service Applications**
 In this project, an intuitive HRI interface for a front-of-house greeting robot (showcase robot) will be developed. It utilizes LLMs and AIs from different sources, all integrated together through API calls. 
 
