@@ -1,13 +1,13 @@
 {
   "device_id": "pi-01",
   "device_type": "raspberry_pi",
-  "timestamp": "2025-11-27T05:57:04Z",
+  "timestamp": "2025-12-14T19:14:09Z",
   "devices": [
     {
       "name": "LED",
       "id": "led",
       "type": "digital_output",
-      "pin": 27,
+      "pin": 17,
       "actions": {
         "on": {},
         "off": {},
@@ -56,7 +56,7 @@
       "name": "Servo Motor",
       "id": "servo",
       "type": "servo",
-      "pin": 17,
+      "pin": 27,
       "actions": {
         "rotate": {
           "parameters": {

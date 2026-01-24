@@ -46,6 +46,65 @@ REGISTRY_TOPIC_LEGACY = "robot/registry"
 REGISTRY_TOPIC_MCP = "robot/device_registry"
 DEVICES_FILE = "devices.json"
 
+# ROS Command Topics
+ROS_CMD_TOPIC = "robot/ros_cmd"          # Publish ROS commands here
+ROS_CMD_VEL_TOPIC = "robot/ros_cmd_vel"  # Direct velocity commands
+ROS_FEEDBACK_TOPIC = "robot/ros_feedback" # Receive feedback from Jetson
+
+# ----------------------------
+# SAFE ROS COMMAND CONFIGURATION
+# ----------------------------
+# Maximum safe velocities for service robot (m/s and rad/s)
+MAX_LINEAR_VELOCITY = 0.5    # 0.5 m/s max forward/backward
+MAX_ANGULAR_VELOCITY = 0.8   # 0.8 rad/s max rotation
+DEFAULT_MOVE_DURATION = 2.0  # Default duration for movements (seconds)
+
+# Safety limits for modular commands
+MAX_DISTANCE_METERS = 5.0    # Maximum allowed distance in one command
+MAX_DURATION_SECONDS = 15.0  # Maximum allowed duration in one command
+MAX_ANGLE_DEGREES = 360.0    # Maximum rotation in one command
+
+# ===========================================
+# CALIBRATION FACTORS - ADJUST THESE VALUES!
+# ===========================================
+# If robot moves LESS than expected, INCREASE these values
+# If robot moves MORE than expected, DECREASE these values
+# Example: If "move 1 meter" only moves 0.5m, set DISTANCE_CALIBRATION = 2.0
+
+DISTANCE_CALIBRATION = 1.0   # Multiplier for distance commands (try 1.5, 2.0, etc.)
+DURATION_CALIBRATION = 1.0   # Multiplier for duration commands (try 1.2, 1.5, etc.)
+ANGLE_CALIBRATION = 1.0      # Multiplier for rotation commands (try 1.5, 2.0, etc.)
+
+# Acceleration compensation - adds extra time for robot to reach full speed
+ACCEL_COMPENSATION_SEC = 0.3  # Extra seconds added to account for acceleration/deceleration
+
+# Base velocities for modular commands (used for distance/angle calculations)
+# These should match what your robot ACTUALLY achieves, not what you command
+BASE_LINEAR_VELOCITY = 0.3   # m/s - Measure actual speed and update this!
+BASE_ANGULAR_VELOCITY = 0.5  # rad/s - Measure actual rotation rate and update this!
+SLOW_LINEAR_VELOCITY = 0.15  # m/s for slow movements
+
+# Whitelisted safe commands with default parameters
+# These serve as defaults when no distance/duration/angle is specified
+# TIP: If defaults feel too short, increase the "duration" values here
+SAFE_ROS_COMMANDS = {
+    "move_forward": {"linear_x": 0.3, "angular_z": 0.0, "duration": 3.0, "type": "linear"},
+    "move_backward": {"linear_x": -0.2, "angular_z": 0.0, "duration": 3.0, "type": "linear"},
+    "turn_left": {"linear_x": 0.0, "angular_z": 0.5, "duration": 2.0, "type": "angular"},
+    "turn_right": {"linear_x": 0.0, "angular_z": -0.5, "duration": 2.0, "type": "angular"},
+    "stop": {"linear_x": 0.0, "angular_z": 0.0, "duration": 0.0, "type": "stop"},
+    "slow_forward": {"linear_x": 0.15, "angular_z": 0.0, "duration": 4.0, "type": "linear"},
+    "rotate_180": {"linear_x": 0.0, "angular_z": 0.5, "duration": 4.0, "type": "angular"},
+    "slight_left": {"linear_x": 0.2, "angular_z": 0.2, "duration": 2.0, "type": "combined"},
+    "slight_right": {"linear_x": 0.2, "angular_z": -0.2, "duration": 2.0, "type": "combined"},
+    "approach": {"linear_x": 0.2, "angular_z": 0.0, "duration": 2.5, "type": "linear"},
+    "retreat": {"linear_x": -0.15, "angular_z": 0.0, "duration": 2.5, "type": "linear"},
+    "guide_forward": {"linear_x": 0.25, "angular_z": 0.0, "duration": 4.0, "type": "linear"},
+}
+
+# Emergency stop flag
+emergency_stop_active = False
+
 # ----------------------------
 # GLOBAL OBJECTS
 # ----------------------------
@@ -168,16 +227,33 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe(STATUS_TOPIC)
     client.subscribe(REGISTRY_TOPIC_LEGACY)
     client.subscribe(REGISTRY_TOPIC_MCP)
+    client.subscribe(ROS_FEEDBACK_TOPIC)  # Subscribe to ROS feedback from Jetson
     # Request status/devices on connect so Pi can respond (retained + active)
     client.publish(REQUEST_TOPIC, json.dumps({"request": "status"}))
     client.publish(REQUEST_TOPIC, json.dumps({"request": "devices"}))
 
 def on_message(client, userdata, msg):
-    global device_states, device_registry
+    global device_states, device_registry, emergency_stop_active
     try:
         payload = json.loads(msg.payload.decode())
     except Exception:
         print("⚠️ Non-JSON MQTT payload on", msg.topic)
+        return
+
+    # Handle ROS feedback from Jetson
+    if msg.topic == ROS_FEEDBACK_TOPIC:
+        feedback_type = payload.get("type", "unknown")
+        if feedback_type == "command_received":
+            print(f"✅ Jetson received command: {payload.get('command')}")
+        elif feedback_type == "command_completed":
+            print(f"✅ Jetson completed command: {payload.get('command')}")
+        elif feedback_type == "error":
+            print(f"❌ Jetson error: {payload.get('message')}")
+        elif feedback_type == "emergency_stop":
+            emergency_stop_active = True
+            print("🛑 Jetson reported emergency stop!")
+        else:
+            print(f"📡 ROS Feedback: {payload}")
         return
 
     if msg.topic in (REGISTRY_TOPIC_LEGACY, REGISTRY_TOPIC_MCP):
@@ -248,6 +324,190 @@ def publish_control_message(msg: dict):
         print("⚠️ Publish error:", e)
 
 # ----------------------------
+# ROS Command Validation and Publishing
+# ----------------------------
+def validate_ros_velocity(linear_x, angular_z):
+    """
+    Clamp velocities to safe limits and return validated values.
+    Returns (clamped_linear, clamped_angular, was_modified)
+    """
+    clamped_linear = max(-MAX_LINEAR_VELOCITY, min(MAX_LINEAR_VELOCITY, linear_x))
+    clamped_angular = max(-MAX_ANGULAR_VELOCITY, min(MAX_ANGULAR_VELOCITY, angular_z))
+    was_modified = (clamped_linear != linear_x) or (clamped_angular != angular_z)
+    if was_modified:
+        print(f"⚠️ Velocity clamped: linear {linear_x}->{clamped_linear}, angular {angular_z}->{clamped_angular}")
+    return clamped_linear, clamped_angular, was_modified
+
+def calculate_duration_from_distance(distance_meters, velocity):
+    """
+    Calculate duration needed to travel a given distance at a given velocity.
+    Returns clamped duration within safety limits.
+    """
+    if velocity == 0:
+        return 0
+    # Clamp distance to safety limit
+    safe_distance = max(0, min(MAX_DISTANCE_METERS, abs(distance_meters)))
+    duration = safe_distance / abs(velocity)
+    # Clamp duration to safety limit
+    return min(duration, MAX_DURATION_SECONDS)
+
+def calculate_duration_from_angle(angle_degrees, angular_velocity):
+    """
+    Calculate duration needed to rotate a given angle at a given angular velocity.
+    Returns clamped duration within safety limits.
+    """
+    import math
+    if angular_velocity == 0:
+        return 0
+    # Clamp angle to safety limit
+    safe_angle = max(0, min(MAX_ANGLE_DEGREES, abs(angle_degrees)))
+    angle_radians = math.radians(safe_angle)
+    duration = angle_radians / abs(angular_velocity)
+    # Clamp duration to safety limit
+    return min(duration, MAX_DURATION_SECONDS)
+
+def parse_modular_parameters(params, command_type):
+    """
+    Parse modular parameters (distance, duration, angle) from LLM output.
+    Returns calculated duration based on the parameter type.
+    
+    Priority: duration > distance > angle > default
+    Applies calibration factors for accuracy.
+    """
+    # If explicit duration is provided, use it (clamped) with calibration
+    if "duration" in params:
+        base_duration = max(0, min(MAX_DURATION_SECONDS, float(params["duration"])))
+        calibrated = (base_duration * DURATION_CALIBRATION) + ACCEL_COMPENSATION_SEC
+        print(f"⏱️ Duration {base_duration}s × {DURATION_CALIBRATION} + {ACCEL_COMPENSATION_SEC}s accel = {calibrated:.2f}s")
+        return min(calibrated, MAX_DURATION_SECONDS)
+    
+    # If distance is provided (for linear movements)
+    if "distance" in params or "distance_meters" in params:
+        distance = float(params.get("distance") or params.get("distance_meters", 0))
+        if command_type in ("linear", "combined"):
+            velocity = BASE_LINEAR_VELOCITY
+            # Use slower velocity for slow commands
+            if "slow" in str(params.get("command", "")).lower():
+                velocity = SLOW_LINEAR_VELOCITY
+            # Apply calibration: more distance needed = longer duration
+            calibrated_distance = distance * DISTANCE_CALIBRATION
+            calculated = calculate_duration_from_distance(calibrated_distance, velocity)
+            calculated += ACCEL_COMPENSATION_SEC  # Add acceleration compensation
+            calculated = min(calculated, MAX_DURATION_SECONDS)
+            print(f"📏 Distance {distance}m × {DISTANCE_CALIBRATION} = {calibrated_distance:.2f}m → {calculated:.2f}s (at {velocity} m/s)")
+            return calculated
+    
+    # If angle is provided (for angular movements)
+    if "angle" in params or "angle_degrees" in params:
+        angle = float(params.get("angle") or params.get("angle_degrees", 0))
+        if command_type in ("angular", "combined"):
+            # Apply calibration: more angle needed = longer duration
+            calibrated_angle = angle * ANGLE_CALIBRATION
+            calculated = calculate_duration_from_angle(calibrated_angle, BASE_ANGULAR_VELOCITY)
+            calculated += ACCEL_COMPENSATION_SEC  # Add acceleration compensation
+            calculated = min(calculated, MAX_DURATION_SECONDS)
+            print(f"🔄 Angle {angle}° × {ANGLE_CALIBRATION} = {calibrated_angle:.1f}° → {calculated:.2f}s")
+            return calculated
+    
+    # No modular parameters - return None to use default
+    return None
+
+def publish_ros_command(command_name, custom_params=None):
+    """
+    Publish a validated ROS command to the Jetson via MQTT.
+    Only whitelisted commands are allowed.
+    
+    Supports modular parameters:
+    - duration: Direct duration in seconds (0-15s)
+    - distance / distance_meters: Distance in meters (converted to duration)
+    - angle / angle_degrees: Rotation angle in degrees (converted to duration)
+    """
+    global emergency_stop_active
+    
+    if emergency_stop_active and command_name != "stop":
+        print("🛑 Emergency stop active - only 'stop' commands allowed")
+        return False
+    
+    command_name = command_name.lower().strip()
+    
+    # Check if command is whitelisted
+    if command_name not in SAFE_ROS_COMMANDS:
+        print(f"⚠️ Unknown ROS command '{command_name}' - not in whitelist. Ignoring.")
+        print(f"   Available commands: {list(SAFE_ROS_COMMANDS.keys())}")
+        return False
+    
+    # Get base command parameters
+    base_params = SAFE_ROS_COMMANDS[command_name].copy()
+    command_type = base_params.get("type", "linear")
+    
+    # Parse modular parameters (distance, angle, duration)
+    if custom_params and isinstance(custom_params, dict):
+        # Add command to params for context
+        custom_params["command"] = command_name
+        calculated_duration = parse_modular_parameters(custom_params, command_type)
+        if calculated_duration is not None:
+            base_params["duration"] = calculated_duration
+        # Do NOT allow velocity overrides from LLM - use predefined safe values only
+    
+    # Validate velocities (should already be safe, but double-check)
+    linear_x, angular_z, _ = validate_ros_velocity(
+        base_params.get("linear_x", 0.0),
+        base_params.get("angular_z", 0.0)
+    )
+    
+    # Calculate expected distance/angle for logging
+    expected_distance = abs(linear_x) * base_params.get("duration", DEFAULT_MOVE_DURATION)
+    expected_angle_rad = abs(angular_z) * base_params.get("duration", DEFAULT_MOVE_DURATION)
+    import math
+    expected_angle_deg = math.degrees(expected_angle_rad)
+    
+    ros_msg = {
+        "command": command_name,
+        "twist": {
+            "linear": {"x": linear_x, "y": 0.0, "z": 0.0},
+            "angular": {"x": 0.0, "y": 0.0, "z": angular_z}
+        },
+        "duration": base_params.get("duration", DEFAULT_MOVE_DURATION),
+        "expected_distance_m": round(expected_distance, 2),
+        "expected_rotation_deg": round(expected_angle_deg, 1),
+        "timestamp": asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else 0
+    }
+    
+    mqtt_client.publish(ROS_CMD_TOPIC, json.dumps(ros_msg))
+    
+    # Enhanced logging
+    if command_type == "linear" and expected_distance > 0:
+        print(f"🤖 Published ROS command: {command_name} -> {expected_distance:.2f}m over {ros_msg['duration']:.2f}s")
+    elif command_type == "angular" and expected_angle_deg > 0:
+        print(f"🤖 Published ROS command: {command_name} -> {expected_angle_deg:.1f}° over {ros_msg['duration']:.2f}s")
+    else:
+        print(f"🤖 Published ROS command: {command_name} -> linear_x={linear_x}, angular_z={angular_z}, duration={ros_msg['duration']}s")
+    
+    return True
+
+def emergency_stop():
+    """Immediately stop the robot and set emergency flag."""
+    global emergency_stop_active
+    emergency_stop_active = True
+    stop_msg = {
+        "command": "emergency_stop",
+        "twist": {
+            "linear": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "angular": {"x": 0.0, "y": 0.0, "z": 0.0}
+        },
+        "duration": 0,
+        "emergency": True
+    }
+    mqtt_client.publish(ROS_CMD_TOPIC, json.dumps(stop_msg))
+    print("🛑 EMERGENCY STOP PUBLISHED")
+
+def clear_emergency_stop():
+    """Clear emergency stop flag to allow new commands."""
+    global emergency_stop_active
+    emergency_stop_active = False
+    print("✅ Emergency stop cleared - robot can receive commands")
+
+# ----------------------------
 # Vision Logic (unchanged)
 # ----------------------------
 def capture_and_analyze(prompt="Describe this image in detail."):
@@ -315,33 +575,99 @@ def get_device_status_prompt():
 # ----------------------------
 # Ask Ollama (keeps device list + states in system prompt)
 # ----------------------------
+def get_ros_commands_prompt():
+    """Return available ROS commands for the LLM with descriptions."""
+    command_descriptions = {
+        "move_forward": "Move forward (default ~0.6m, or specify distance/duration)",
+        "move_backward": "Move backward (default ~0.4m, or specify distance/duration)",
+        "turn_left": "Rotate left/counter-clockwise (default ~45°, or specify angle/duration)",
+        "turn_right": "Rotate right/clockwise (default ~45°, or specify angle/duration)",
+        "stop": "Immediately stop all movement",
+        "slow_forward": "Move forward slowly (default ~0.45m, or specify distance/duration)",
+        "rotate_180": "Rotate 180 degrees (turn around)",
+        "slight_left": "Move forward while turning slightly left",
+        "slight_right": "Move forward while turning slightly right",
+        "approach": "Slowly approach forward (default ~0.3m)",
+        "retreat": "Slowly back away (default ~0.2m)",
+        "guide_forward": "Guide mode - steady forward (default ~0.75m)",
+    }
+    lines = []
+    for cmd, desc in command_descriptions.items():
+        lines.append(f"  - {cmd}: {desc}")
+    return "\n".join(lines)
+
 def ask_ollama(user_text):
     device_list = load_devices_prompt()
     device_status = get_device_status_prompt()
+    ros_commands = get_ros_commands_prompt()
     system_prompt = (
-    "You are Robert, a helpful intelligent assistant.\n"
-    "You have access to IoT devices and a camera.\n\n"
+    "You are Robert, a helpful intelligent service robot assistant.\n"
+    "You have access to IoT devices, a camera, and ROBOT MOVEMENT controls.\n\n"
     "DEVICE LIST (from devices.json):\n"
     f"{device_list}\n\n"
     "CURRENT DEVICE STATES (live telemetry):\n"
     f"{device_status}\n\n"
-    "User Request Handling:\n"
-    "1. 'reply': A short, friendly verbal response for the user.\n"
-    "2. 'action': Either a single action object or a list of actions. Each action must be a JSON object containing 'mcp_action' and optional 'parameters'.\n\n"
-    "For Vision/Camera requests, include 'vision_prompt' in the parameters to ask the camera a specific question based on user intent.\n\n"
-    "IMPORTANT:\n"
-    "- NEVER return 'state':'beep', 'action':'beep', or 'tone_sequence'.\n"
-    "- For buzzer control, ALWAYS use 'frequency': <Hz>, 'duration': <seconds>.\n"
-    "- For vision requests, generate a contextual 'vision_prompt' that best answers the user's question.\n"
-    "- Ensure 'device' fields match available device ids/names listed above.\n"
-    "- If multiple steps are needed, return 'action' as a list of action objects.\n"
-    "- Constantly check the states for contextual awareness, for example if the LED is already in a ON state, and the user asks you to turn it on, inform the user that it is already on. Do the same for the servo or the buzzer when needed.\n"
-    "Example Vision Response:\n"
-    "{\"reply\":\"Let me look at that for you.\",\"action\":[{\"mcp_action\":\"capture_image\","
-    "\"parameters\":[{\"vision_prompt\":\"Count how many objects are visible in the image\"}]}]}\n"
-    "Example Response:\n"
-    "{\"reply\":\"OK\",\"action\":[{\"mcp_action\":\"control_device\","
-    "\"parameters\":[{\"device\":\"buzzer\",\"frequency\":440,\"duration\":0.5}]}]}"
+    "AVAILABLE ROS MOVEMENT COMMANDS (ONLY use these exact names):\n"
+    f"{ros_commands}\n\n"
+    "=== RESPONSE FORMAT ===\n"
+    "You MUST respond with valid JSON only. Format:\n"
+    "{\"reply\": \"<verbal response>\", \"action\": <action or list of actions>}\n\n"
+    "Each action must be: {\"mcp_action\": \"<type>\", \"parameters\": [<params>]}\n\n"
+    "=== SAFETY-FIRST REASONING ===\n"
+    "Before executing ANY movement command, you MUST evaluate:\n"
+    "1. INTENT ANALYSIS: What does the user actually want to achieve?\n"
+    "2. SAFETY CHECK: Is this request safe in the current context?\n"
+    "3. APPROPRIATE RESPONSE: Choose the safest command that achieves the goal.\n\n"
+    "SAFETY RULES (MANDATORY):\n"
+    "- ONLY use commands from AVAILABLE ROS MOVEMENT COMMANDS above.\n"
+    "- NEVER invent or hallucinate new movement commands.\n"
+    "- NEVER specify velocity values - they are predefined for safety.\n"
+    "- If user asks for something dangerous (e.g., 'go fast', 'maximum speed'), politely REFUSE.\n"
+    "- If unsure about intent, ASK for clarification instead of guessing.\n"
+    "- Use 'stop' IMMEDIATELY if user says: stop, halt, wait, danger, emergency, or indicates concern.\n"
+    "- For large movements, confirm with user first or break into smaller steps.\n"
+    "- When guiding people, use slow, predictable movements (slow_forward, guide_forward).\n\n"
+    "INTENT INTERPRETATION EXAMPLES:\n"
+    "- 'Come here' / 'Come to me' → approach (slow, careful approach)\n"
+    "- 'Go away' / 'Back off' → retreat (back away from user)\n"
+    "- 'Follow me' / 'Come with me' → guide_forward (steady paced following)\n"
+    "- 'Turn around' → rotate_180\n"
+    "- 'Face me' / 'Look at me' → turn_left or turn_right based on context\n"
+    "- 'Go left' / 'Go right' → slight_left or slight_right (forward + turn)\n"
+    "- 'Just turn' → turn_left or turn_right (rotation only)\n"
+    "- 'Move a bit' / 'Nudge forward' → slow_forward\n"
+    "- 'STOP!' / 'Freeze!' / 'Halt!' → stop (immediate)\n\n"
+    "MULTI-STEP SEQUENCES:\n"
+    "For complex navigation, return multiple actions in order:\n"
+    "{\"action\": [{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"turn_left\"}]},\n"
+    "             {\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_forward\"}]}]}\n\n"
+    "=== ROS COMMAND FORMAT (MODULAR) ===\n"
+    "Basic command: {\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"<command_name>\"}]}\n\n"
+    "MODULAR PARAMETERS (specify distance, angle, OR duration):\n"
+    "- distance (meters): For linear movements - 'move forward 2 meters'\n"
+    "  {\"command\":\"move_forward\", \"distance\": 2.0}\n"
+    "- angle (degrees): For rotations - 'turn left 90 degrees'\n"
+    "  {\"command\":\"turn_left\", \"angle\": 90}\n"
+    "- duration (seconds): Direct time control - 'move for 5 seconds'\n"
+    "  {\"command\":\"move_forward\", \"duration\": 5.0}\n\n"
+    "SAFETY LIMITS: Max distance=5m, Max angle=360°, Max duration=15s\n"
+    "If user exceeds limits, values are automatically clamped for safety.\n\n"
+    "=== VISION/CAMERA ===\n"
+    "For vision requests, use 'capture_image' with a contextual vision_prompt:\n"
+    "{\"mcp_action\":\"capture_image\",\"parameters\":[{\"vision_prompt\":\"<question>\"}]}\n\n"
+    "=== IOT DEVICES ===\n"
+    "For buzzer: use 'frequency': <Hz>, 'duration': <seconds>\n"
+    "For LED/servo: use 'state': 'on'/'off' or position values\n"
+    "Check device_states to avoid redundant actions (e.g., don't turn on LED if already on).\n\n"
+    "EXAMPLES:\n"
+    "User: 'Move forward' → {\"reply\":\"Moving forward.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_forward\"}]}]}\n"
+    "User: 'Move forward 2 meters' → {\"reply\":\"Moving forward 2 meters.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_forward\",\"distance\":2.0}]}]}\n"
+    "User: 'Turn left 90 degrees' → {\"reply\":\"Turning left 90 degrees.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"turn_left\",\"angle\":90}]}]}\n"
+    "User: 'Move backward for 3 seconds' → {\"reply\":\"Moving backward for 3 seconds.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_backward\",\"duration\":3.0}]}]}\n"
+    "User: 'Come here slowly' → {\"reply\":\"Approaching you carefully.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"approach\"}]}]}\n"
+    "User: 'Go fast!' → {\"reply\":\"I'm sorry, I can only move at safe speeds for everyone's safety. Would you like me to move forward at my normal pace?\",\"action\":[]}\n"
+    "User: 'Turn around and go forward 1 meter' → {\"reply\":\"Turning around, then moving forward 1 meter.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"rotate_180\"}]},{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_forward\",\"distance\":1.0}]}]}\n"
+    "User: 'STOP!' → {\"reply\":\"Stopping immediately.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"stop\"}]}]}\n"
     )
     try:
         res = ollama_client.chat(
@@ -484,6 +810,69 @@ async def handle_request(parameters):
             mqtt_client.publish(REQUEST_TOPIC, json.dumps({"request": "devices"}))
             print("📨 Requested devices from devices.")
 
+
+async def handle_ros_command(parameters):
+    """
+    Handle ROS movement commands from the LLM.
+    Validates commands against the whitelist and publishes to MQTT for Jetson.
+    
+    parameters: list of dicts, each with 'command' and optional 'duration'
+    
+    Safety Features:
+    - Only whitelisted commands are allowed
+    - Velocities are predefined and cannot be overridden by LLM
+    - Duration is clamped to safe limits (0-10 seconds)
+    - Emergency stop takes priority
+    """
+    if not isinstance(parameters, list):
+        parameters = [parameters] if isinstance(parameters, dict) else []
+    
+    for p in parameters:
+        if not isinstance(p, dict):
+            print(f"⚠️ Invalid ROS command parameter: {p}")
+            continue
+        
+        command = p.get("command", "").lower().strip()
+        if not command:
+            print("⚠️ ROS command parameter missing 'command' field")
+            continue
+        
+        # Handle emergency stop commands immediately
+        if command in ("emergency_stop", "e_stop", "estop"):
+            emergency_stop()
+            await speak("Emergency stop activated. Robot is halted.")
+            return
+        
+        # Handle clear emergency stop
+        if command in ("clear_emergency", "reset", "resume"):
+            clear_emergency_stop()
+            await speak("Emergency stop cleared. Robot ready for commands.")
+            return
+        
+        # Extract modular parameters (duration, distance, angle)
+        custom_params = {}
+        if "duration" in p:
+            custom_params["duration"] = p["duration"]
+        if "distance" in p:
+            custom_params["distance"] = p["distance"]
+        if "distance_meters" in p:
+            custom_params["distance_meters"] = p["distance_meters"]
+        if "angle" in p:
+            custom_params["angle"] = p["angle"]
+        if "angle_degrees" in p:
+            custom_params["angle_degrees"] = p["angle_degrees"]
+        
+        # Publish the validated command with modular parameters
+        success = publish_ros_command(command, custom_params)
+        
+        if not success:
+            # Command was rejected - inform user
+            available = ", ".join(SAFE_ROS_COMMANDS.keys())
+            await speak(f"I can't do that movement. Available commands are: {available}")
+        else:
+            # Wait briefly for command to be received before next command
+            await asyncio.sleep(0.1)
+
 # central dispatcher for action types
 async def handle_action(action_obj):
     """
@@ -508,6 +897,8 @@ async def handle_action(action_obj):
         await handle_capture_image(params)
     elif action_type in ("request", "ask"):
         await handle_request(params)
+    elif action_type in ("ros_command", "move", "navigate", "robot_move", "movement"):
+        await handle_ros_command(params)
     else:
         print(f"⚠️ Unknown action type '{action_type}', skipping. Action: {action_obj}")
 

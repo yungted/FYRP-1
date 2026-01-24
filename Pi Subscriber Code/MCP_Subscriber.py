@@ -15,7 +15,7 @@ import os
 # =========================
 # GPIO SETUP
 # =========================
-LED_PIN = 27        # fixed pin
+LED_PIN = 17        
 BUZZER_PIN = 4
 SERVO_PIN = 17
 
@@ -57,7 +57,7 @@ STATE = {
 # =========================
 # MQTT CONFIG
 # =========================
-MQTT_BROKER = os.environ.get("MQTT_BROKER", "172.17.9.98")
+MQTT_BROKER = os.environ.get("MQTT_BROKER", "192.168.0.165")
 TOPIC_REGISTRY = "robot/device_registry"
 TOPIC_CONTROL  = "robot/control"
 TOPIC_STATUS   = "robot/status"
