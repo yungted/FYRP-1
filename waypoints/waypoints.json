@@ -1,0 +1,18 @@
+{
+  "waypoints": {
+    "start": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0,
+      "w": 1.0,
+      "description": "Start location",
+      "created_at": "2026-01-24T18:25:35.042214",
+      "visited_count": 2,
+      "last_visited": "2026-01-24T18:27:30.020975"
+    }
+  },
+  "metadata": {
+    "last_updated": "2026-01-24T18:27:30.020975",
+    "total_waypoints": 1
+  }
+}

@@ -26,6 +26,7 @@ import cv2
 from PIL import Image
 import moondream as md
 from TTS.api import TTS
+from waypoints.waypoint_manager import WaypointManager, extract_waypoint_name_from_command
 
 # ----------------------------
 # CONFIGURATION
@@ -51,6 +52,11 @@ ROS_CMD_TOPIC = "robot/ros_cmd"          # Publish ROS commands here
 ROS_CMD_VEL_TOPIC = "robot/ros_cmd_vel"  # Direct velocity commands
 ROS_FEEDBACK_TOPIC = "robot/ros_feedback" # Receive feedback from Jetson
 
+# Navigation Topics
+WAYPOINT_NAV_TOPIC = "robot/navigate_waypoint"  # Send waypoint navigation requests
+WAYPOINT_FEEDBACK_TOPIC = "robot/waypoint_feedback"  # Receive navigation feedback
+CURRENT_POSE_TOPIC = "robot/current_pose"  # Subscribe to robot's current pose
+
 # ----------------------------
 # SAFE ROS COMMAND CONFIGURATION
 # ----------------------------
@@ -73,7 +79,7 @@ MAX_ANGLE_DEGREES = 360.0    # Maximum rotation in one command
 
 DISTANCE_CALIBRATION = 1.0   # Multiplier for distance commands (try 1.5, 2.0, etc.)
 DURATION_CALIBRATION = 1.0   # Multiplier for duration commands (try 1.2, 1.5, etc.)
-ANGLE_CALIBRATION = 1.0      # Multiplier for rotation commands (try 1.5, 2.0, etc.)
+ANGLE_CALIBRATION = 0.5      # Multiplier for rotation commands (reduced from 1.0 - robot turns ~2x too much)
 
 # Acceleration compensation - adds extra time for robot to reach full speed
 ACCEL_COMPENSATION_SEC = 0.3  # Extra seconds added to account for acceleration/deceleration
@@ -126,6 +132,11 @@ microphone_active = True  # send silence when False
 
 device_states = {}   # flattened live telemetry
 device_registry = {} # canonical registry object (MCP-like)
+
+# Waypoint management
+waypoint_manager = WaypointManager()
+current_robot_pose = {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}  # Current pose from amcl_pose
+robot_nav_status = "idle"  # idle, navigating, reached, failed
 
 # ----------------------------
 # Utilities: registry file handling + validation helpers
@@ -228,16 +239,52 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe(REGISTRY_TOPIC_LEGACY)
     client.subscribe(REGISTRY_TOPIC_MCP)
     client.subscribe(ROS_FEEDBACK_TOPIC)  # Subscribe to ROS feedback from Jetson
+    client.subscribe(WAYPOINT_FEEDBACK_TOPIC)  # Subscribe to waypoint navigation feedback
+    client.subscribe(CURRENT_POSE_TOPIC)  # Subscribe to robot's current pose
     # Request status/devices on connect so Pi can respond (retained + active)
     client.publish(REQUEST_TOPIC, json.dumps({"request": "status"}))
     client.publish(REQUEST_TOPIC, json.dumps({"request": "devices"}))
 
 def on_message(client, userdata, msg):
-    global device_states, device_registry, emergency_stop_active
+    global device_states, device_registry, emergency_stop_active, robot_nav_status, current_robot_pose
     try:
         payload = json.loads(msg.payload.decode())
     except Exception:
         print("⚠️ Non-JSON MQTT payload on", msg.topic)
+        return
+
+    # Handle current pose updates (from amcl_pose subscriber on Jetson)
+    if msg.topic == CURRENT_POSE_TOPIC:
+        try:
+            current_robot_pose = {
+                "x": float(payload.get("x", 0.0)),
+                "y": float(payload.get("y", 0.0)),
+                "z": float(payload.get("z", 0.0)),
+                "w": float(payload.get("w", 1.0))
+            }
+            print(f"📍 Current pose: ({current_robot_pose['x']:.2f}, {current_robot_pose['y']:.2f})")
+        except Exception as e:
+            print(f"⚠️ Error parsing pose: {e}")
+        return
+
+    # Handle waypoint navigation feedback
+    if msg.topic == WAYPOINT_FEEDBACK_TOPIC:
+        feedback_type = payload.get("type", "unknown")
+        if feedback_type == "navigation_started":
+            waypoint = payload.get("waypoint", "unknown")
+            robot_nav_status = "navigating"
+            print(f"🗺️ Started navigation to waypoint: {waypoint}")
+        elif feedback_type == "waypoint_reached":
+            waypoint = payload.get("waypoint", "unknown")
+            robot_nav_status = "reached"
+            waypoint_manager.mark_visited(waypoint)
+            print(f"✅ Reached waypoint: {waypoint}")
+        elif feedback_type == "navigation_failed":
+            reason = payload.get("reason", "unknown")
+            robot_nav_status = "failed"
+            print(f"❌ Navigation failed: {reason}")
+        else:
+            print(f"📡 Waypoint Feedback: {payload}")
         return
 
     # Handle ROS feedback from Jetson
@@ -596,23 +643,63 @@ def get_ros_commands_prompt():
         lines.append(f"  - {cmd}: {desc}")
     return "\n".join(lines)
 
+def get_navigation_context_prompt():
+    """
+    Build navigation context for LLM including available waypoints,
+    current robot pose, and navigation capabilities.
+    """
+    waypoint_context = waypoint_manager.get_context_for_llm()
+    
+    pose_info = f"Current Position: ({current_robot_pose['x']:.2f}, {current_robot_pose['y']:.2f})"
+    nav_status = f"Navigation Status: {robot_nav_status}"
+    
+    return f"\n{pose_info}\n{nav_status}\n\n{waypoint_context}"
+
 def ask_ollama(user_text):
     device_list = load_devices_prompt()
     device_status = get_device_status_prompt()
     ros_commands = get_ros_commands_prompt()
+    nav_context = get_navigation_context_prompt()
+    
     system_prompt = (
     "You are Robert, a helpful intelligent service robot assistant.\n"
-    "You have access to IoT devices, a camera, and ROBOT MOVEMENT controls.\n\n"
+    "You have access to IoT devices, a camera, and ROBOT MOVEMENT controls.\n"
+    "You can navigate to saved locations (waypoints) using the navigate_to_waypoint action.\n\n"
     "DEVICE LIST (from devices.json):\n"
     f"{device_list}\n\n"
     "CURRENT DEVICE STATES (live telemetry):\n"
     f"{device_status}\n\n"
+    "NAVIGATION CONTEXT:\n"
+    f"{nav_context}\n\n"
     "AVAILABLE ROS MOVEMENT COMMANDS (ONLY use these exact names):\n"
     f"{ros_commands}\n\n"
     "=== RESPONSE FORMAT ===\n"
     "You MUST respond with valid JSON only. Format:\n"
     "{\"reply\": \"<verbal response>\", \"action\": <action or list of actions>}\n\n"
     "Each action must be: {\"mcp_action\": \"<type>\", \"parameters\": [<params>]}\n\n"
+    "=== CONTEXT-AWARE COMMAND INTERPRETATION ===\n"
+    "You are an intelligent assistant that interprets high-level user commands and converts them to low-level ROS actions.\n\n"
+    "COMMAND INTERPRETATION STRATEGY:\n"
+    "1. UNDERSTAND INTENT: Analyze what the user wants to achieve, not just literal commands\n"
+    "2. CHECK CONTEXT: Consider robot's current pose, navigation status, and available waypoints\n"
+    "3. CHOOSE METHOD: Select between:\n"
+    "   a) Low-level ROS commands (move_forward, turn_left, etc.) for local navigation\n"
+    "   b) Waypoint navigation (navigate_to_waypoint) for predefined locations\n"
+    "4. RESPOND NATURALLY: Explain what you're doing in conversational language\n\n"
+    "=== NAVIGATING TO WAYPOINTS ===\n"
+    "When user mentions a location that matches a saved waypoint, use navigate_to_waypoint:\n"
+    "{\"mcp_action\":\"navigate_to_waypoint\",\"parameters\":[{\"waypoint\":\"waypoint_name\"}]}\n\n"
+    "Examples:\n"
+    "- User: 'Go to kitchen' → Find 'kitchen' waypoint and navigate\n"
+    "- User: 'Take me to the living room' → Find 'living_room' waypoint and navigate\n"
+    "- User: 'Head to bedroom' → Find 'bedroom' waypoint and navigate\n\n"
+    "SAVE/UPDATE WAYPOINTS:\n"
+    "When user says 'save this location as <name>' or 'remember this as <name>':\n"
+    "{\"mcp_action\":\"save_waypoint\",\"parameters\":[{\"waypoint_name\":\"<name>\",\"description\":\"<location description>\"}]}\n\n"
+    "CLEAR/DELETE WAYPOINTS:\n"
+    "When user explicitly says 'clear all waypoints', 'delete all waypoints', 'forget all locations', or 'reset waypoints':\n"
+    "{\"mcp_action\":\"clear_waypoints\",\"parameters\":[]}\n"
+    "⚠️ SAFETY: Only use this action if the user EXPLICITLY requests it. Never hallucinate this command.\n\n"
     "=== SAFETY-FIRST REASONING ===\n"
     "Before executing ANY movement command, you MUST evaluate:\n"
     "1. INTENT ANALYSIS: What does the user actually want to achieve?\n"
@@ -620,27 +707,36 @@ def ask_ollama(user_text):
     "3. APPROPRIATE RESPONSE: Choose the safest command that achieves the goal.\n\n"
     "SAFETY RULES (MANDATORY):\n"
     "- ONLY use commands from AVAILABLE ROS MOVEMENT COMMANDS above.\n"
-    "- NEVER invent or hallucinate new movement commands.\n"
+    "- NEVER invent or hallucinate new movement commands or waypoints that don't exist.\n"
     "- NEVER specify velocity values - they are predefined for safety.\n"
     "- If user asks for something dangerous (e.g., 'go fast', 'maximum speed'), politely REFUSE.\n"
     "- If unsure about intent, ASK for clarification instead of guessing.\n"
     "- Use 'stop' IMMEDIATELY if user says: stop, halt, wait, danger, emergency, or indicates concern.\n"
     "- For large movements, confirm with user first or break into smaller steps.\n"
-    "- When guiding people, use slow, predictable movements (slow_forward, guide_forward).\n\n"
-    "INTENT INTERPRETATION EXAMPLES:\n"
+    "- When guiding people, use slow, predictable movements (slow_forward, guide_forward).\n"
+    "- If a waypoint doesn't exist, suggest checking available waypoints or saving a new one.\n\n"
+    "INTENT INTERPRETATION EXAMPLES (Local Movement):\n"
     "- 'Come here' / 'Come to me' → approach (slow, careful approach)\n"
     "- 'Go away' / 'Back off' → retreat (back away from user)\n"
     "- 'Follow me' / 'Come with me' → guide_forward (steady paced following)\n"
-    "- 'Turn around' → rotate_180\n"
-    "- 'Face me' / 'Look at me' → turn_left or turn_right based on context\n"
+    "- 'Turn around' / 'Turn around and face me' → rotate_180 + potentially turn_left/turn_right\n"
+    "- 'Face me' / 'Look at me' → turn_left or turn_right (choose based on robot's orientation)\n"
     "- 'Go left' / 'Go right' → slight_left or slight_right (forward + turn)\n"
     "- 'Just turn' → turn_left or turn_right (rotation only)\n"
-    "- 'Move a bit' / 'Nudge forward' → slow_forward\n"
+    "- 'Move a bit' / 'Nudge forward' → slow_forward with small distance\n"
     "- 'STOP!' / 'Freeze!' / 'Halt!' → stop (immediate)\n\n"
+    "INTENT INTERPRETATION EXAMPLES (Navigation):\n"
+    "- 'Go to [location]' / 'Navigate to [location]' / 'Take me to [location]' → navigate_to_waypoint\n"
+    "- 'Go to kitchen' → navigate_to_waypoint with waypoint='kitchen'\n"
+    "- 'Remember this as my office' / 'Save this as office' → save_waypoint\n"
+    "- 'What locations do I have saved?' / 'List waypoints' → Describe available waypoints from context\n\n"
     "MULTI-STEP SEQUENCES:\n"
     "For complex navigation, return multiple actions in order:\n"
     "{\"action\": [{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"turn_left\"}]},\n"
     "             {\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_forward\"}]}]}\n\n"
+    "Example: User says 'Turn around and go to the kitchen'\n"
+    "{\"action\": [{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"rotate_180\"}]},\n"
+    "             {\"mcp_action\":\"navigate_to_waypoint\",\"parameters\":[{\"waypoint\":\"kitchen\"}]}]}\n\n"
     "=== ROS COMMAND FORMAT (MODULAR) ===\n"
     "Basic command: {\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"<command_name>\"}]}\n\n"
     "MODULAR PARAMETERS (specify distance, angle, OR duration):\n"
@@ -659,14 +755,13 @@ def ask_ollama(user_text):
     "For buzzer: use 'frequency': <Hz>, 'duration': <seconds>\n"
     "For LED/servo: use 'state': 'on'/'off' or position values\n"
     "Check device_states to avoid redundant actions (e.g., don't turn on LED if already on).\n\n"
-    "EXAMPLES:\n"
+    "=== EXAMPLES ===\n"
     "User: 'Move forward' → {\"reply\":\"Moving forward.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_forward\"}]}]}\n"
     "User: 'Move forward 2 meters' → {\"reply\":\"Moving forward 2 meters.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_forward\",\"distance\":2.0}]}]}\n"
+    "User: 'Go to kitchen' → {\"reply\":\"Navigating to the kitchen now.\",\"action\":[{\"mcp_action\":\"navigate_to_waypoint\",\"parameters\":[{\"waypoint\":\"kitchen\"}]}]}\n"
+    "User: 'Save this location as office' → {\"reply\":\"Saving this location as office.\",\"action\":[{\"mcp_action\":\"save_waypoint\",\"parameters\":[{\"waypoint_name\":\"office\",\"description\":\"Office location\"}]}]}\n"
     "User: 'Turn left 90 degrees' → {\"reply\":\"Turning left 90 degrees.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"turn_left\",\"angle\":90}]}]}\n"
-    "User: 'Move backward for 3 seconds' → {\"reply\":\"Moving backward for 3 seconds.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_backward\",\"duration\":3.0}]}]}\n"
-    "User: 'Come here slowly' → {\"reply\":\"Approaching you carefully.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"approach\"}]}]}\n"
-    "User: 'Go fast!' → {\"reply\":\"I'm sorry, I can only move at safe speeds for everyone's safety. Would you like me to move forward at my normal pace?\",\"action\":[]}\n"
-    "User: 'Turn around and go forward 1 meter' → {\"reply\":\"Turning around, then moving forward 1 meter.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"rotate_180\"}]},{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"move_forward\",\"distance\":1.0}]}]}\n"
+    "User: 'Turn around and go to living room' → {\"reply\":\"Turning around and heading to the living room.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"rotate_180\"}]},{\"mcp_action\":\"navigate_to_waypoint\",\"parameters\":[{\"waypoint\":\"living_room\"}]}]}\n"
     "User: 'STOP!' → {\"reply\":\"Stopping immediately.\",\"action\":[{\"mcp_action\":\"ros_command\",\"parameters\":[{\"command\":\"stop\"}]}]}\n"
     )
     try:
@@ -873,9 +968,201 @@ async def handle_ros_command(parameters):
             # Wait briefly for command to be received before next command
             await asyncio.sleep(0.1)
 
-# central dispatcher for action types
+
+async def handle_navigate_to_waypoint(parameters):
+    """
+    Handle navigation to a saved waypoint using Nav2.
+    
+    parameters: list of dicts with 'waypoint' field (waypoint name)
+    
+    This sends a high-level navigation request to the Jetson which uses Nav2's
+    navigate_to_pose action to autonomously navigate to the target.
+    
+    Features:
+    - Waypoint validation before sending
+    - Clear feedback to user on navigation start/completion
+    - Error handling for non-existent waypoints
+    """
+    if not isinstance(parameters, list):
+        parameters = [parameters] if isinstance(parameters, dict) else []
+    
+    for p in parameters:
+        if not isinstance(p, dict):
+            print(f"⚠️ Invalid navigate parameter: {p}")
+            await speak("I encountered an error with the navigation parameters.")
+            continue
+        
+        waypoint_name = p.get("waypoint", "").lower().strip()
+        if not waypoint_name:
+            print("⚠️ navigate_to_waypoint missing 'waypoint' field")
+            await speak("I need to know which waypoint you want me to navigate to.")
+            continue
+        
+        # Validate waypoint exists
+        waypoint_data = waypoint_manager.get_waypoint(waypoint_name)
+        if not waypoint_data:
+            available = ", ".join(waypoint_manager.list_waypoints())
+            if available:
+                await speak(f"I don't have a waypoint named '{waypoint_name}'. "
+                           f"Available waypoints are: {available}. "
+                           f"Would you like me to save this location as '{waypoint_name}'?")
+            else:
+                await speak(f"I don't have any waypoints saved yet. "
+                           f"You can say 'save this location as {waypoint_name}' to create one.")
+            print(f"⚠️ Waypoint '{waypoint_name}' not found in registry")
+            continue
+        
+        # Extract ROS pose from waypoint
+        x, y, z, w = waypoint_data["x"], waypoint_data["y"], waypoint_data["z"], waypoint_data["w"]
+        description = waypoint_data.get("description", waypoint_name)
+        
+        # Create navigation message for Jetson
+        nav_msg = {
+            "action": "navigate_to_pose",
+            "waypoint": waypoint_name,
+            "pose": {
+                "x": x,
+                "y": y,
+                "z": z,
+                "w": w
+            },
+            "description": description
+        }
+        
+        # Publish to Jetson
+        mqtt_client.publish(WAYPOINT_NAV_TOPIC, json.dumps(nav_msg))
+        
+        print(f"🗺️ Requesting navigation to waypoint '{waypoint_name}' at ({x:.2f}, {y:.2f})")
+        await speak(f"I'm navigating to the {description}. This may take a moment.")
+
+
+async def handle_save_waypoint(parameters):
+    """
+    Handle saving the robot's current position as a named waypoint.
+    
+    parameters: list of dicts with 'waypoint_name' and optional 'description'
+    
+    This uses the robot's current AMCL pose to save the location with a semantic name.
+    The user can later reference this waypoint by name for navigation.
+    """
+    if not isinstance(parameters, list):
+        parameters = [parameters] if isinstance(parameters, dict) else []
+    
+    for p in parameters:
+        if not isinstance(p, dict):
+            print(f"⚠️ Invalid save_waypoint parameter: {p}")
+            await speak("I encountered an error saving the waypoint.")
+            continue
+        
+        waypoint_name = p.get("waypoint_name", "").lower().strip()
+        description = p.get("description", "")
+        
+        if not waypoint_name:
+            print("⚠️ save_waypoint missing 'waypoint_name' field")
+            await speak("I need a name to save this location.")
+            continue
+        
+        # Use current robot pose
+        x = current_robot_pose.get("x", 0.0)
+        y = current_robot_pose.get("y", 0.0)
+        z = current_robot_pose.get("z", 0.0)
+        w = current_robot_pose.get("w", 1.0)
+        
+        # Generate description if not provided
+        if not description:
+            description = f"Location at ({x:.2f}, {y:.2f})"
+        
+        # Add or update waypoint
+        success = waypoint_manager.add_waypoint(
+            waypoint_name, x, y, z, w, description
+        )
+        
+        if success:
+            await speak(f"Saved this location as {waypoint_name}. I can navigate here later if you ask.")
+            print(f"✅ Waypoint '{waypoint_name}' saved at ({x:.2f}, {y:.2f})")
+        else:
+            await speak(f"I couldn't save the waypoint '{waypoint_name}'. Please try a different name.")
+            print(f"❌ Failed to save waypoint '{waypoint_name}'")
+
+
+async def handle_list_waypoints(parameters):
+    """
+    List all available waypoints to the user.
+    
+    This gives the user a verbal readout of all saved waypoints and their descriptions.
+    """
+    waypoints = waypoint_manager.list_waypoints()
+    
+    if not waypoints:
+        await speak("I haven't saved any waypoints yet. You can say 'save this location as' followed by a name.")
+        print("📍 No waypoints available")
+        return
+    
+    # Build a nice verbal list
+    waypoint_list = []
+    for name in waypoints:
+        wp = waypoint_manager.get_waypoint(name)
+        desc = wp.get("description", name)
+        waypoint_list.append(f"{name}: {desc}")
+    
+    message = "Here are the locations I have saved: " + ", ".join(waypoint_list)
+    await speak(message)
+    print(f"📍 Listed {len(waypoints)} waypoints")
+
+
+async def handle_clear_waypoints(parameters):
+    """
+    Handle request to delete all saved waypoints.
+    
+    This is a safety-critical operation that requires explicit confirmation.
+    The user must say "clear all waypoints" or "delete all waypoints" to trigger.
+    
+    parameters: list of dicts with optional 'confirm' field (for testing)
+    
+    Safety Features:
+    - Prints debug inventory before deletion
+    - Requires explicit user confirmation
+    - Prints confirmation after deletion
+    - Prevents accidental data loss
+    """
+    # Check if there are waypoints to delete
+    count = waypoint_manager.get_waypoint_count()
+    
+    if count == 0:
+        await speak("There are no waypoints to delete.")
+        print("📍 No waypoints to clear")
+        return
+    
+    # Print current inventory for debugging
+    print(f"🔍 WAYPOINT DELETION REQUESTED - Current inventory:")
+    waypoint_manager.print_all_waypoints()
+    
+    # Perform the deletion with confirmation
+    success = waypoint_manager.clear_all_waypoints(confirm=True)
+    
+    if success:
+        await speak(f"I have deleted all {count} saved locations. You can save new ones whenever you want.")
+        print(f"✅ Successfully cleared {count} waypoints")
+    else:
+        await speak("I couldn't delete the waypoints. Please try again.")
+        print("❌ Failed to clear waypoints")
+
+
 async def handle_action(action_obj):
     """
+    Dispatch actions to appropriate handlers based on mcp_action type.
+    
+    Supported action types:
+    - control_device: Control IoT devices (LED, buzzer, servo, etc.)
+    - delay: Pause execution for specified duration
+    - capture_image: Take image and analyze with vision model
+    - request: Request status or device list from robot
+    - ros_command: Execute low-level ROS movement commands
+    - navigate_to_waypoint: Navigate to a saved waypoint using Nav2
+    - save_waypoint: Save current robot position as a waypoint
+    - list_waypoints: List all available waypoints
+    - clear_waypoints: Delete all saved waypoints (safety-critical)
+    
     action_obj: {"mcp_action": "...", "parameters": [...]}
     """
     if not isinstance(action_obj, dict):
@@ -899,6 +1186,14 @@ async def handle_action(action_obj):
         await handle_request(params)
     elif action_type in ("ros_command", "move", "navigate", "robot_move", "movement"):
         await handle_ros_command(params)
+    elif action_type in ("navigate_to_waypoint", "goto_waypoint", "navigate"):
+        await handle_navigate_to_waypoint(params)
+    elif action_type in ("save_waypoint", "save_location", "remember_location"):
+        await handle_save_waypoint(params)
+    elif action_type in ("list_waypoints", "show_waypoints", "what_waypoints"):
+        await handle_list_waypoints(params)
+    elif action_type in ("clear_waypoints", "delete_waypoints", "clear_all_waypoints", "delete_all_waypoints"):
+        await handle_clear_waypoints(params)
     else:
         print(f"⚠️ Unknown action type '{action_type}', skipping. Action: {action_obj}")
 
