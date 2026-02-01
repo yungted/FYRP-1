@@ -1,18 +1,38 @@
 {
   "waypoints": {
     "start": {
-      "x": 0.0,
-      "y": 0.0,
-      "z": 0.0,
-      "w": 1.0,
-      "description": "Start location",
+      "x": 1.35,
+      "y": 13.7933,
+      "z": 0.7038,
+      "w": 0.7104,
+      "description": "User designated start location",
       "created_at": "2026-01-24T18:25:35.042214",
+      "visited_count": 7,
+      "last_visited": "2026-01-28T19:38:55.669010"
+    },
+    "lab_1": {
+      "x": 2.1289,
+      "y": 24.4417,
+      "z": -0.9937,
+      "w": 0.112,
+      "description": "Lab one location",
+      "created_at": "2026-01-28T19:32:36.571642",
+      "visited_count": 1,
+      "last_visited": "2026-01-28T19:33:52.716813"
+    },
+    "toilet": {
+      "x": 0.9298,
+      "y": -0.9246,
+      "z": 0.7091,
+      "w": 0.7051,
+      "description": "Toilet location",
+      "created_at": "2026-01-28T19:35:31.091353",
       "visited_count": 2,
-      "last_visited": "2026-01-24T18:27:30.020975"
+      "last_visited": "2026-01-28T19:40:20.975130"
     }
   },
   "metadata": {
-    "last_updated": "2026-01-24T18:27:30.020975",
-    "total_waypoints": 1
+    "last_updated": "2026-01-28T19:40:20.975130",
+    "total_waypoints": 3
   }
 }

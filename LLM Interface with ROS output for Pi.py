@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import re
+from datetime import datetime
 import websockets
 import sounddevice as sd
 import numpy as np
@@ -36,7 +37,7 @@ OLLAMA_KEY = "add508d2d17443e8b9953322d3751470.vmwVMnfKMep0zN42BPIMoidp"
 MOONDREAM_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJrZXlfaWQiOiIxZWI5Njk0MS02MDVlLTQ3ZTYtYjI5NS01NjdjMGRjYWZhYTkiLCJvcmdfaWQiOiJlZzJ2bXo4a1FWY0xlOTExQVl5bkM0NU44YkhEYTMwTyIsImlhdCI6MTc2MjkzMzIzOSwidmVyIjoxfQ.onaMxtqh-X14ggd8XUDfiALxzYuHuUyI3GMbWHBYCqw"
 
 CAM_INDEX = 2  # Default webcam index
-WAKE_WORDS = ["hey robert", "hey, robert", "hi robert", "okay robert"]
+WAKE_WORDS = ["hey robert", "hey, robert", "hi, robert", "okay, robert"]
 MQTT_BROKER = "192.168.0.165"
 
 # Topics (subscribe to both legacy and MCP topics for compatibility)
@@ -46,11 +47,14 @@ REQUEST_TOPIC = "robot/request"
 REGISTRY_TOPIC_LEGACY = "robot/registry"
 REGISTRY_TOPIC_MCP = "robot/device_registry"
 DEVICES_FILE = "devices.json"
+PICTURES_FOLDER = "Pictures"  # Folder to store captured photos
 
 # ROS Command Topics
 ROS_CMD_TOPIC = "robot/ros_cmd"          # Publish ROS commands here
-ROS_CMD_VEL_TOPIC = "robot/ros_cmd_vel"  # Direct velocity commands
 ROS_FEEDBACK_TOPIC = "robot/ros_feedback" # Receive feedback from Jetson
+
+# Nav2 Relative Movement Topic (NEW - uses NavigateToPose with relative goals)
+NAV2_RELATIVE_MOVE_TOPIC = "robot/nav2_relative_move"  # Obstacle-aware relative movements
 
 # Navigation Topics
 WAYPOINT_NAV_TOPIC = "robot/navigate_waypoint"  # Send waypoint navigation requests
@@ -61,51 +65,42 @@ CURRENT_POSE_TOPIC = "robot/current_pose"  # Subscribe to robot's current pose
 # SAFE ROS COMMAND CONFIGURATION
 # ----------------------------
 # Maximum safe velocities for service robot (m/s and rad/s)
-MAX_LINEAR_VELOCITY = 0.5    # 0.5 m/s max forward/backward
-MAX_ANGULAR_VELOCITY = 0.8   # 0.8 rad/s max rotation
-DEFAULT_MOVE_DURATION = 2.0  # Default duration for movements (seconds)
+MAX_LINEAR_VELOCITY = 0.20   # 0.20 m/s max - safe indoor speed
+MAX_ANGULAR_VELOCITY = 0.4   # 0.4 rad/s max rotation
+DEFAULT_MOVE_DURATION = 3.0  # Default duration for movements (seconds)
 
 # Safety limits for modular commands
 MAX_DISTANCE_METERS = 5.0    # Maximum allowed distance in one command
-MAX_DURATION_SECONDS = 15.0  # Maximum allowed duration in one command
-MAX_ANGLE_DEGREES = 360.0    # Maximum rotation in one command
+MAX_DURATION_SECONDS = 30.0  # Maximum allowed duration (Nav2 handles this)
+MAX_ANGLE_DEGREES = 180.0    # Maximum rotation in one command
+
+# Nav2 Navigation Speed (passed to Nav2 for path execution)
+NAV2_MAX_SPEED = 0.20        # m/s - Nav2 will use this as max speed
+
+# Default distances/angles for voice commands without specific values
+DEFAULT_FORWARD_DISTANCE = 1.0   # meters - "move forward" without distance
+DEFAULT_BACKWARD_DISTANCE = 0.5  # meters - "move backward" without distance  
+DEFAULT_TURN_ANGLE = 90.0        # degrees - "turn left/right" without angle
 
 # ===========================================
-# CALIBRATION FACTORS - ADJUST THESE VALUES!
+# MOVEMENT COMMANDS - Nav2 Relative Navigation
 # ===========================================
-# If robot moves LESS than expected, INCREASE these values
-# If robot moves MORE than expected, DECREASE these values
-# Example: If "move 1 meter" only moves 0.5m, set DISTANCE_CALIBRATION = 2.0
+# These commands use Nav2's NavigateToPose with relative goal calculation
+# The robot will plan a path and avoid obstacles automatically!
 
-DISTANCE_CALIBRATION = 1.0   # Multiplier for distance commands (try 1.5, 2.0, etc.)
-DURATION_CALIBRATION = 1.0   # Multiplier for duration commands (try 1.2, 1.5, etc.)
-ANGLE_CALIBRATION = 0.5      # Multiplier for rotation commands (reduced from 1.0 - robot turns ~2x too much)
-
-# Acceleration compensation - adds extra time for robot to reach full speed
-ACCEL_COMPENSATION_SEC = 0.3  # Extra seconds added to account for acceleration/deceleration
-
-# Base velocities for modular commands (used for distance/angle calculations)
-# These should match what your robot ACTUALLY achieves, not what you command
-BASE_LINEAR_VELOCITY = 0.3   # m/s - Measure actual speed and update this!
-BASE_ANGULAR_VELOCITY = 0.5  # rad/s - Measure actual rotation rate and update this!
-SLOW_LINEAR_VELOCITY = 0.15  # m/s for slow movements
-
-# Whitelisted safe commands with default parameters
-# These serve as defaults when no distance/duration/angle is specified
-# TIP: If defaults feel too short, increase the "duration" values here
-SAFE_ROS_COMMANDS = {
-    "move_forward": {"linear_x": 0.3, "angular_z": 0.0, "duration": 3.0, "type": "linear"},
-    "move_backward": {"linear_x": -0.2, "angular_z": 0.0, "duration": 3.0, "type": "linear"},
-    "turn_left": {"linear_x": 0.0, "angular_z": 0.5, "duration": 2.0, "type": "angular"},
-    "turn_right": {"linear_x": 0.0, "angular_z": -0.5, "duration": 2.0, "type": "angular"},
-    "stop": {"linear_x": 0.0, "angular_z": 0.0, "duration": 0.0, "type": "stop"},
-    "slow_forward": {"linear_x": 0.15, "angular_z": 0.0, "duration": 4.0, "type": "linear"},
-    "rotate_180": {"linear_x": 0.0, "angular_z": 0.5, "duration": 4.0, "type": "angular"},
-    "slight_left": {"linear_x": 0.2, "angular_z": 0.2, "duration": 2.0, "type": "combined"},
-    "slight_right": {"linear_x": 0.2, "angular_z": -0.2, "duration": 2.0, "type": "combined"},
-    "approach": {"linear_x": 0.2, "angular_z": 0.0, "duration": 2.5, "type": "linear"},
-    "retreat": {"linear_x": -0.15, "angular_z": 0.0, "duration": 2.5, "type": "linear"},
-    "guide_forward": {"linear_x": 0.25, "angular_z": 0.0, "duration": 4.0, "type": "linear"},
+# Command definitions with default values
+# distance: meters, angle: degrees, duration: seconds (for time-based moves)
+MOVEMENT_COMMANDS = {
+    "move_forward": {"type": "linear", "direction": 1, "default_distance": 1.0},
+    "move_backward": {"type": "linear", "direction": -1, "default_distance": 0.5},
+    "turn_left": {"type": "rotation", "direction": 1, "default_angle": 90},
+    "turn_right": {"type": "rotation", "direction": -1, "default_angle": 90},
+    "stop": {"type": "stop"},
+    "approach": {"type": "linear", "direction": 1, "default_distance": 0.3},
+    "retreat": {"type": "linear", "direction": -1, "default_distance": 0.3},
+    "rotate_180": {"type": "rotation", "direction": 1, "default_angle": 180},
+    "slight_left": {"type": "rotation", "direction": 1, "default_angle": 30},
+    "slight_right": {"type": "rotation", "direction": -1, "default_angle": 30},
 }
 
 # Emergency stop flag
@@ -386,88 +381,30 @@ def validate_ros_velocity(linear_x, angular_z):
     return clamped_linear, clamped_angular, was_modified
 
 def calculate_duration_from_distance(distance_meters, velocity):
-    """
-    Calculate duration needed to travel a given distance at a given velocity.
-    Returns clamped duration within safety limits.
-    """
+    """Calculate estimated duration for Nav2 timeout purposes."""
     if velocity == 0:
-        return 0
-    # Clamp distance to safety limit
+        return 30.0  # Default timeout
     safe_distance = max(0, min(MAX_DISTANCE_METERS, abs(distance_meters)))
-    duration = safe_distance / abs(velocity)
-    # Clamp duration to safety limit
-    return min(duration, MAX_DURATION_SECONDS)
+    # Add buffer time for acceleration/deceleration
+    return min((safe_distance / abs(velocity)) * 2 + 5.0, MAX_DURATION_SECONDS)
 
-def calculate_duration_from_angle(angle_degrees, angular_velocity):
-    """
-    Calculate duration needed to rotate a given angle at a given angular velocity.
-    Returns clamped duration within safety limits.
-    """
-    import math
-    if angular_velocity == 0:
-        return 0
-    # Clamp angle to safety limit
-    safe_angle = max(0, min(MAX_ANGLE_DEGREES, abs(angle_degrees)))
-    angle_radians = math.radians(safe_angle)
-    duration = angle_radians / abs(angular_velocity)
-    # Clamp duration to safety limit
-    return min(duration, MAX_DURATION_SECONDS)
 
-def parse_modular_parameters(params, command_type):
+def publish_nav2_movement(command_name, custom_params=None):
     """
-    Parse modular parameters (distance, duration, angle) from LLM output.
-    Returns calculated duration based on the parameter type.
+    Publish a Nav2-based movement command to the Jetson via MQTT.
     
-    Priority: duration > distance > angle > default
-    Applies calibration factors for accuracy.
-    """
-    # If explicit duration is provided, use it (clamped) with calibration
-    if "duration" in params:
-        base_duration = max(0, min(MAX_DURATION_SECONDS, float(params["duration"])))
-        calibrated = (base_duration * DURATION_CALIBRATION) + ACCEL_COMPENSATION_SEC
-        print(f"⏱️ Duration {base_duration}s × {DURATION_CALIBRATION} + {ACCEL_COMPENSATION_SEC}s accel = {calibrated:.2f}s")
-        return min(calibrated, MAX_DURATION_SECONDS)
+    This uses Nav2's NavigateToPose with relative goal calculation.
+    The Jetson will:
+    1. Get current robot pose
+    2. Calculate target pose based on movement request
+    3. Use Nav2 to navigate with full obstacle avoidance
     
-    # If distance is provided (for linear movements)
-    if "distance" in params or "distance_meters" in params:
-        distance = float(params.get("distance") or params.get("distance_meters", 0))
-        if command_type in ("linear", "combined"):
-            velocity = BASE_LINEAR_VELOCITY
-            # Use slower velocity for slow commands
-            if "slow" in str(params.get("command", "")).lower():
-                velocity = SLOW_LINEAR_VELOCITY
-            # Apply calibration: more distance needed = longer duration
-            calibrated_distance = distance * DISTANCE_CALIBRATION
-            calculated = calculate_duration_from_distance(calibrated_distance, velocity)
-            calculated += ACCEL_COMPENSATION_SEC  # Add acceleration compensation
-            calculated = min(calculated, MAX_DURATION_SECONDS)
-            print(f"📏 Distance {distance}m × {DISTANCE_CALIBRATION} = {calibrated_distance:.2f}m → {calculated:.2f}s (at {velocity} m/s)")
-            return calculated
+    Supports:
+    - distance (meters): "move forward 1.5 meters"
+    - angle (degrees): "turn left 90 degrees"  
+    - duration (seconds): "move forward for 3 seconds" -> converts to distance
     
-    # If angle is provided (for angular movements)
-    if "angle" in params or "angle_degrees" in params:
-        angle = float(params.get("angle") or params.get("angle_degrees", 0))
-        if command_type in ("angular", "combined"):
-            # Apply calibration: more angle needed = longer duration
-            calibrated_angle = angle * ANGLE_CALIBRATION
-            calculated = calculate_duration_from_angle(calibrated_angle, BASE_ANGULAR_VELOCITY)
-            calculated += ACCEL_COMPENSATION_SEC  # Add acceleration compensation
-            calculated = min(calculated, MAX_DURATION_SECONDS)
-            print(f"🔄 Angle {angle}° × {ANGLE_CALIBRATION} = {calibrated_angle:.1f}° → {calculated:.2f}s")
-            return calculated
-    
-    # No modular parameters - return None to use default
-    return None
-
-def publish_ros_command(command_name, custom_params=None):
-    """
-    Publish a validated ROS command to the Jetson via MQTT.
-    Only whitelisted commands are allowed.
-    
-    Supports modular parameters:
-    - duration: Direct duration in seconds (0-15s)
-    - distance / distance_meters: Distance in meters (converted to duration)
-    - angle / angle_degrees: Rotation angle in degrees (converted to duration)
+    This is SAFE - Nav2 handles obstacle avoidance automatically!
     """
     global emergency_stop_active
     
@@ -477,76 +414,116 @@ def publish_ros_command(command_name, custom_params=None):
     
     command_name = command_name.lower().strip()
     
-    # Check if command is whitelisted
-    if command_name not in SAFE_ROS_COMMANDS:
-        print(f"⚠️ Unknown ROS command '{command_name}' - not in whitelist. Ignoring.")
-        print(f"   Available commands: {list(SAFE_ROS_COMMANDS.keys())}")
+    # Handle stop command immediately
+    if command_name == "stop":
+        stop_msg = {"command": "stop", "cancel_navigation": True}
+        mqtt_client.publish(NAV2_RELATIVE_MOVE_TOPIC, json.dumps(stop_msg))
+        print("🛑 Stop command sent - cancelling any active navigation")
+        return True
+    
+    # Check if command is valid
+    if command_name not in MOVEMENT_COMMANDS:
+        print(f"⚠️ Unknown movement command '{command_name}'")
+        print(f"   Available: {list(MOVEMENT_COMMANDS.keys())}")
         return False
     
-    # Get base command parameters
-    base_params = SAFE_ROS_COMMANDS[command_name].copy()
-    command_type = base_params.get("type", "linear")
+    cmd_config = MOVEMENT_COMMANDS[command_name]
+    cmd_type = cmd_config.get("type", "linear")
+    direction = cmd_config.get("direction", 1)
     
-    # Parse modular parameters (distance, angle, duration)
+    # Extract parameters from LLM output
+    distance = None
+    angle = None
+    duration = None
+    
     if custom_params and isinstance(custom_params, dict):
-        # Add command to params for context
-        custom_params["command"] = command_name
-        calculated_duration = parse_modular_parameters(custom_params, command_type)
-        if calculated_duration is not None:
-            base_params["duration"] = calculated_duration
-        # Do NOT allow velocity overrides from LLM - use predefined safe values only
+        # Distance in meters
+        if "distance" in custom_params:
+            distance = float(custom_params["distance"])
+        elif "distance_meters" in custom_params:
+            distance = float(custom_params["distance_meters"])
+        
+        # Angle in degrees
+        if "angle" in custom_params:
+            angle = float(custom_params["angle"])
+        elif "angle_degrees" in custom_params:
+            angle = float(custom_params["angle_degrees"])
+        
+        # Duration in seconds (convert to distance)
+        if "duration" in custom_params:
+            duration = float(custom_params["duration"])
     
-    # Validate velocities (should already be safe, but double-check)
-    linear_x, angular_z, _ = validate_ros_velocity(
-        base_params.get("linear_x", 0.0),
-        base_params.get("angular_z", 0.0)
-    )
-    
-    # Calculate expected distance/angle for logging
-    expected_distance = abs(linear_x) * base_params.get("duration", DEFAULT_MOVE_DURATION)
-    expected_angle_rad = abs(angular_z) * base_params.get("duration", DEFAULT_MOVE_DURATION)
-    import math
-    expected_angle_deg = math.degrees(expected_angle_rad)
-    
-    ros_msg = {
+    # Build the Nav2 relative movement message
+    nav2_msg = {
         "command": command_name,
-        "twist": {
-            "linear": {"x": linear_x, "y": 0.0, "z": 0.0},
-            "angular": {"x": 0.0, "y": 0.0, "z": angular_z}
-        },
-        "duration": base_params.get("duration", DEFAULT_MOVE_DURATION),
-        "expected_distance_m": round(expected_distance, 2),
-        "expected_rotation_deg": round(expected_angle_deg, 1),
-        "timestamp": asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else 0
+        "type": cmd_type,
+        "direction": direction,
+        "max_speed": NAV2_MAX_SPEED,
     }
     
-    mqtt_client.publish(ROS_CMD_TOPIC, json.dumps(ros_msg))
+    if cmd_type == "linear":
+        # Linear movement (forward/backward)
+        if distance is not None:
+            # User specified distance
+            nav2_msg["distance_meters"] = min(abs(distance), MAX_DISTANCE_METERS) * direction
+        elif duration is not None:
+            # Convert duration to distance: distance = speed * time
+            estimated_distance = NAV2_MAX_SPEED * min(duration, MAX_DURATION_SECONDS)
+            nav2_msg["distance_meters"] = min(estimated_distance, MAX_DISTANCE_METERS) * direction
+        else:
+            # Use default distance for this command
+            default_dist = cmd_config.get("default_distance", DEFAULT_FORWARD_DISTANCE)
+            nav2_msg["distance_meters"] = default_dist * direction
+        
+        # Set timeout based on distance
+        timeout = calculate_duration_from_distance(abs(nav2_msg["distance_meters"]), NAV2_MAX_SPEED)
+        nav2_msg["timeout_seconds"] = timeout
+        
+        print(f"🗺️ Nav2 Move: {nav2_msg['distance_meters']:.2f}m (timeout: {timeout:.1f}s) - obstacle-aware!")
+        
+    elif cmd_type == "rotation":
+        # Rotation (turn left/right)
+        if angle is not None:
+            # User specified angle
+            nav2_msg["angle_degrees"] = min(abs(angle), MAX_ANGLE_DEGREES) * direction
+        elif duration is not None:
+            # Convert duration to angle estimate (rough conversion)
+            estimated_angle = (duration / 2.0) * 90  # ~90 degrees per 2 seconds
+            nav2_msg["angle_degrees"] = min(estimated_angle, MAX_ANGLE_DEGREES) * direction
+        else:
+            # Use default angle for this command
+            default_angle = cmd_config.get("default_angle", DEFAULT_TURN_ANGLE)
+            nav2_msg["angle_degrees"] = default_angle * direction
+        
+        # Set timeout for rotation
+        nav2_msg["timeout_seconds"] = 15.0  # Rotations should be quick
+        
+        print(f"🗺️ Nav2 Rotate: {nav2_msg['angle_degrees']:.1f}° (timeout: {nav2_msg['timeout_seconds']:.1f}s) - obstacle-aware!")
     
-    # Enhanced logging
-    if command_type == "linear" and expected_distance > 0:
-        print(f"🤖 Published ROS command: {command_name} -> {expected_distance:.2f}m over {ros_msg['duration']:.2f}s")
-    elif command_type == "angular" and expected_angle_deg > 0:
-        print(f"🤖 Published ROS command: {command_name} -> {expected_angle_deg:.1f}° over {ros_msg['duration']:.2f}s")
-    else:
-        print(f"🤖 Published ROS command: {command_name} -> linear_x={linear_x}, angular_z={angular_z}, duration={ros_msg['duration']}s")
-    
+    # Publish to Nav2 relative movement topic
+    mqtt_client.publish(NAV2_RELATIVE_MOVE_TOPIC, json.dumps(nav2_msg))
     return True
 
+
+# Keep legacy function name for compatibility
+def publish_ros_command(command_name, custom_params=None):
+    """Legacy wrapper - now uses Nav2 relative movement."""
+    return publish_nav2_movement(command_name, custom_params)
+
+
 def emergency_stop():
-    """Immediately stop the robot and set emergency flag."""
+    """Immediately stop the robot and cancel any navigation."""
     global emergency_stop_active
     emergency_stop_active = True
     stop_msg = {
         "command": "emergency_stop",
-        "twist": {
-            "linear": {"x": 0.0, "y": 0.0, "z": 0.0},
-            "angular": {"x": 0.0, "y": 0.0, "z": 0.0}
-        },
-        "duration": 0,
+        "cancel_navigation": True,
         "emergency": True
     }
-    mqtt_client.publish(ROS_CMD_TOPIC, json.dumps(stop_msg))
+    mqtt_client.publish(NAV2_RELATIVE_MOVE_TOPIC, json.dumps(stop_msg))
+    mqtt_client.publish(ROS_CMD_TOPIC, json.dumps(stop_msg))  # Also send to legacy topic
     print("🛑 EMERGENCY STOP PUBLISHED")
+
 
 def clear_emergency_stop():
     """Clear emergency stop flag to allow new commands."""
@@ -578,6 +555,83 @@ def capture_and_analyze(prompt="Describe this image in detail."):
     except Exception as e:
         print(f"⚠️ Moondream error: {e}")
         return "I had trouble analyzing the image."
+
+
+def count_people_in_frame():
+    """
+    Capture a frame and count how many people are visible.
+    Returns (count, frame, image_pil) where count is the number of people detected.
+    """
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        return -1, None, None
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        return -1, None, None
+    
+    try:
+        # Convert to PIL for Moondream
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image_pil = Image.fromarray(frame_rgb)
+        
+        # Ask Moondream to count people
+        response = moondream_model.query(image_pil, "How many people are in this image? Reply with just a number. If no people, say 0.")
+        answer = response.get("answer", "0").strip()
+        
+        # Extract number from response
+        import re
+        numbers = re.findall(r'\d+', answer)
+        count = int(numbers[0]) if numbers else 0
+        print(f"👥 People detected: {count}")
+        return count, frame, image_pil
+    except Exception as e:
+        print(f"⚠️ Error counting people: {e}")
+        return 0, frame, None
+
+
+def save_photo_to_pictures(frame, photo_type="photo", description=""):
+    """
+    Save a captured frame to the Pictures folder with timestamp.
+    Returns the filepath if successful, None otherwise.
+    """
+    # Ensure Pictures folder exists
+    os.makedirs(PICTURES_FOLDER, exist_ok=True)
+    
+    # Generate filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_type = photo_type.replace(" ", "_").lower()
+    filename = f"{safe_type}_{timestamp}.jpg"
+    filepath = os.path.join(PICTURES_FOLDER, filename)
+    
+    try:
+        cv2.imwrite(filepath, frame)
+        print(f"📸 Photo saved: {filepath}")
+        return filepath
+    except Exception as e:
+        print(f"⚠️ Error saving photo: {e}")
+        return None
+
+
+def analyze_scene_for_photo(image_pil, photo_type):
+    """
+    Analyze if the scene is good for the requested photo type.
+    Returns (is_good, suggestion) tuple.
+    """
+    try:
+        if "selfie" in photo_type.lower():
+            response = moondream_model.query(image_pil, "Is there a person close to the camera suitable for a selfie? Answer yes or no, and briefly describe positioning.")
+        elif "group" in photo_type.lower():
+            response = moondream_model.query(image_pil, "Are the people in frame well positioned for a group photo? Are they all visible and well framed? Answer briefly.")
+        else:
+            response = moondream_model.query(image_pil, "Is this a good composition for a photo? Describe briefly.")
+        
+        answer = response.get("answer", "")
+        print(f"📷 Scene analysis: {answer}")
+        return answer
+    except Exception as e:
+        print(f"⚠️ Scene analysis error: {e}")
+        return "Unable to analyze scene."
 
 # ----------------------------
 # LLM Prompt helpers
@@ -623,20 +677,18 @@ def get_device_status_prompt():
 # Ask Ollama (keeps device list + states in system prompt)
 # ----------------------------
 def get_ros_commands_prompt():
-    """Return available ROS commands for the LLM with descriptions."""
+    """Return available movement commands for the LLM with descriptions."""
     command_descriptions = {
-        "move_forward": "Move forward (default ~0.6m, or specify distance/duration)",
-        "move_backward": "Move backward (default ~0.4m, or specify distance/duration)",
-        "turn_left": "Rotate left/counter-clockwise (default ~45°, or specify angle/duration)",
-        "turn_right": "Rotate right/clockwise (default ~45°, or specify angle/duration)",
-        "stop": "Immediately stop all movement",
-        "slow_forward": "Move forward slowly (default ~0.45m, or specify distance/duration)",
-        "rotate_180": "Rotate 180 degrees (turn around)",
-        "slight_left": "Move forward while turning slightly left",
-        "slight_right": "Move forward while turning slightly right",
-        "approach": "Slowly approach forward (default ~0.3m)",
-        "retreat": "Slowly back away (default ~0.2m)",
-        "guide_forward": "Guide mode - steady forward (default ~0.75m)",
+        "move_forward": "Move forward (default 1m, or specify distance in meters or duration in seconds)",
+        "move_backward": "Move backward (default 0.5m, or specify distance/duration)",
+        "turn_left": "Rotate left/counter-clockwise (default 90°, or specify angle in degrees)",
+        "turn_right": "Rotate right/clockwise (default 90°, or specify angle in degrees)",
+        "stop": "Immediately stop all movement and cancel navigation",
+        "rotate_180": "Turn around (rotate 180 degrees)",
+        "approach": "Slowly approach forward (default 0.3m) - for getting closer to objects/people",
+        "retreat": "Slowly back away (default 0.3m) - for moving away safely",
+        "slight_left": "Small left turn (30 degrees)",
+        "slight_right": "Small right turn (30 degrees)",
     }
     lines = []
     for cmd, desc in command_descriptions.items():
@@ -749,8 +801,23 @@ def ask_ollama(user_text):
     "SAFETY LIMITS: Max distance=5m, Max angle=360°, Max duration=15s\n"
     "If user exceeds limits, values are automatically clamped for safety.\n\n"
     "=== VISION/CAMERA ===\n"
-    "For vision requests, use 'capture_image' with a contextual vision_prompt:\n"
+    "For vision requests (analyzing what's in front), use 'capture_image' with a contextual vision_prompt:\n"
     "{\"mcp_action\":\"capture_image\",\"parameters\":[{\"vision_prompt\":\"<question>\"}]}\n\n"
+    "=== PHOTO CAPTURE (SELFIES, GROUP PHOTOS) ===\n"
+    "For taking photos that are SAVED to the Pictures folder, use 'take_photo':\n"
+    "{\"mcp_action\":\"take_photo\",\"parameters\":[{\"photo_type\":\"<type>\",\"expected_people\":<number>,\"countdown\":<seconds>}]}\n\n"
+    "Photo types: 'selfie', 'group_photo', 'portrait', 'photo'\n"
+    "- expected_people: Number of people that should be in the photo (optional)\n"
+    "- countdown: Seconds to count down before capture (default: 3)\n\n"
+    "AWARENESS FEATURE: Before capturing, I will analyze the scene to ensure:\n"
+    "- For selfies: At least 1 person is visible and well-positioned\n"
+    "- For group photos: The expected number of people are visible\n"
+    "- Good composition and framing\n"
+    "If conditions aren't met, I'll ask the user to adjust before taking the photo.\n\n"
+    "Examples:\n"
+    "- 'Take a selfie' → {\"mcp_action\":\"take_photo\",\"parameters\":[{\"photo_type\":\"selfie\",\"expected_people\":1}]}\n"
+    "- 'Take a group photo of 4 people' → {\"mcp_action\":\"take_photo\",\"parameters\":[{\"photo_type\":\"group_photo\",\"expected_people\":4}]}\n"
+    "- 'Take a picture' → {\"mcp_action\":\"take_photo\",\"parameters\":[{\"photo_type\":\"photo\"}]}\n\n"
     "=== IOT DEVICES ===\n"
     "For buzzer: use 'frequency': <Hz>, 'duration': <seconds>\n"
     "For LED/servo: use 'state': 'on'/'off' or position values\n"
@@ -882,6 +949,104 @@ async def handle_capture_image(parameters):
     description = await asyncio.to_thread(capture_and_analyze, prompt)
     await speak(f"I see {description}")
 
+
+async def handle_take_photo(parameters):
+    """
+    Handle photo capture requests (selfie, group photo, general photo).
+    
+    This function is "aware" - it analyzes the scene before capturing to ensure
+    the photo request can be fulfilled (e.g., checking for correct number of people).
+    
+    parameters: list of dicts with:
+        - photo_type: "selfie", "group_photo", "photo", etc.
+        - expected_people: (optional) number of people expected in the photo
+        - description: (optional) description for the photo
+        - countdown: (optional) countdown before taking photo (default: 3)
+    """
+    if not isinstance(parameters, list):
+        parameters = [parameters] if isinstance(parameters, dict) else [{}]
+    
+    for p in parameters:
+        if not isinstance(p, dict):
+            p = {}
+        
+        photo_type = p.get("photo_type", "photo").lower()
+        expected_people = p.get("expected_people", None)
+        description = p.get("description", "")
+        countdown = p.get("countdown", 3)
+        
+        # Determine expected people based on photo type if not specified
+        if expected_people is None:
+            if "selfie" in photo_type:
+                expected_people = 1
+            elif "group" in photo_type:
+                expected_people = 2  # At least 2 for group
+        
+        print(f"📷 Photo request: {photo_type}, expecting {expected_people} people")
+        
+        # Step 1: Analyze the scene first
+        await speak(f"Let me check if everyone is in frame for the {photo_type}.")
+        
+        people_count, frame, image_pil = await asyncio.to_thread(count_people_in_frame)
+        
+        if people_count == -1 or frame is None:
+            await speak("I'm having trouble accessing the camera. Please try again.")
+            continue
+        
+        # Step 2: Check if we have the expected number of people
+        if expected_people is not None:
+            if "selfie" in photo_type and people_count == 0:
+                await speak("I don't see anyone in front of the camera. Please position yourself for the selfie.")
+                continue
+            elif "group" in photo_type:
+                if people_count < expected_people:
+                    await speak(f"I can only see {people_count} {'person' if people_count == 1 else 'people'}, but you asked for a photo with {expected_people}. Please make sure everyone is in frame.")
+                    continue
+                elif people_count > expected_people:
+                    await speak(f"I see {people_count} people, which is more than the {expected_people} you mentioned. I'll take the photo with everyone visible.")
+            elif people_count == 0 and photo_type in ["selfie", "portrait"]:
+                await speak("I don't see anyone in the frame. Please position yourself for the photo.")
+                continue
+        
+        # Step 3: Analyze scene composition
+        if image_pil:
+            scene_feedback = await asyncio.to_thread(analyze_scene_for_photo, image_pil, photo_type)
+        
+        # Step 4: Countdown and capture
+        if countdown and countdown > 0:
+            await speak(f"Perfect! I see {people_count} {'person' if people_count == 1 else 'people'}. Get ready!")
+            for i in range(int(countdown), 0, -1):
+                await speak(str(i))
+                await asyncio.sleep(0.8)
+        
+        # Capture final photo
+        cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            await speak("I couldn't access the camera for the final capture.")
+            continue
+        ret, final_frame = cap.read()
+        cap.release()
+        
+        if not ret:
+            await speak("I failed to capture the photo. Please try again.")
+            continue
+        
+        # Save the photo
+        filepath = await asyncio.to_thread(save_photo_to_pictures, final_frame, photo_type, description)
+        
+        if filepath:
+            # Confirm with buzzer
+            publish_control_message({"device": "buzzer", "action": "beep"})
+            
+            if "selfie" in photo_type:
+                await speak(f"Selfie captured and saved! You look great!")
+            elif "group" in photo_type:
+                await speak(f"Group photo captured with {people_count} people! The photo has been saved.")
+            else:
+                await speak(f"Photo captured and saved to the Pictures folder.")
+        else:
+            await speak("I captured the photo but had trouble saving it.")
+
 async def handle_request(parameters):
     """
     Handles requests generated by the LLM such as 'status' or 'devices'.
@@ -962,7 +1127,7 @@ async def handle_ros_command(parameters):
         
         if not success:
             # Command was rejected - inform user
-            available = ", ".join(SAFE_ROS_COMMANDS.keys())
+            available = ", ".join(MOVEMENT_COMMANDS.keys())
             await speak(f"I can't do that movement. Available commands are: {available}")
         else:
             # Wait briefly for command to be received before next command
@@ -1194,6 +1359,8 @@ async def handle_action(action_obj):
         await handle_list_waypoints(params)
     elif action_type in ("clear_waypoints", "delete_waypoints", "clear_all_waypoints", "delete_all_waypoints"):
         await handle_clear_waypoints(params)
+    elif action_type in ("take_photo", "capture_photo", "take_picture", "selfie", "group_photo"):
+        await handle_take_photo(params)
     else:
         print(f"⚠️ Unknown action type '{action_type}', skipping. Action: {action_obj}")
 

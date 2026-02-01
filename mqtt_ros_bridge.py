@@ -42,7 +42,7 @@ from rclpy.qos import (
 
 from geometry_msgs.msg import Twist, PoseWithCovarianceStamped, PoseStamped
 from nav_msgs.msg import Odometry
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import NavigateToPose, DriveOnHeading, Spin
 import paho.mqtt.client as mqtt
 import json
 import threading
@@ -58,8 +58,9 @@ MQTT_PORT = 1883
 MQTT_TIMEOUT = 60
 
 # Topic Subscriptions
-ROS_CMD_TOPIC = "robot/ros_cmd"          # Receive movement commands
-WAYPOINT_NAV_TOPIC = "robot/navigate_waypoint"  # Receive waypoint navigation requests
+ROS_CMD_TOPIC = "robot/ros_cmd"          # Legacy direct velocity commands
+WAYPOINT_NAV_TOPIC = "robot/navigate_waypoint"  # Waypoint navigation requests
+NAV2_RELATIVE_MOVE_TOPIC = "robot/nav2_relative_move"  # NEW: Nav2-based relative movements (obstacle-aware!)
 
 # Topic Publications
 ROS_FEEDBACK_TOPIC = "robot/ros_feedback"        # Send command execution feedback
@@ -78,12 +79,15 @@ CMD_VEL_PUBLISH_RATE = 10  # Hz (publish every 0.1 seconds)
 CMD_VEL_RATE_PERIOD = 1.0 / CMD_VEL_PUBLISH_RATE
 
 # =========================================================
-# SAFETY LIMITS
+# SAFETY LIMITS - REDUCED for indoor safety
 # =========================================================
-MAX_LINEAR_VELOCITY = 0.5    # m/s - Maximum forward/backward speed
-MAX_ANGULAR_VELOCITY = 0.8   # rad/s - Maximum rotation speed
+MAX_LINEAR_VELOCITY = 0.25   # m/s - Maximum forward/backward speed (reduced from 0.5)
+MAX_ANGULAR_VELOCITY = 0.5   # rad/s - Maximum rotation speed (reduced from 0.8)
 NAV_TIMEOUT_SECONDS = 300    # 5 minutes - timeout for autonomous navigation
-MOVEMENT_COMMAND_TIMEOUT = 15  # seconds - timeout for velocity commands
+MOVEMENT_COMMAND_TIMEOUT = 10  # seconds - timeout for velocity commands (reduced from 15)
+
+# Nav2 Behavior limits
+BEHAVIOR_TIMEOUT_SECONDS = 30  # Timeout for DriveOnHeading/Spin behaviors
 
 
 class MqttRosBridge(Node):
@@ -145,6 +149,23 @@ class MqttRosBridge(Node):
             '/navigate_to_pose'
         )
         
+        # Nav2 Behavior action clients (for obstacle-aware movement)
+        # DriveOnHeading: Move in a straight line while respecting costmap
+        self.drive_on_heading_client = ActionClient(
+            self,
+            DriveOnHeading,
+            '/drive_on_heading'
+        )
+        
+        # Spin: Rotate in place while respecting costmap
+        self.spin_client = ActionClient(
+            self,
+            Spin,
+            '/spin'
+        )
+        
+        self.get_logger().info("🔄 Nav2 behavior action clients initialized")
+        
         # ====== MQTT Setup ======
         self.mqtt_client = mqtt.Client(client_id="jetson-ros-bridge")
         self.mqtt_client.on_connect = self.on_mqtt_connect
@@ -182,7 +203,8 @@ class MqttRosBridge(Node):
         # Subscribe to command topics
         client.subscribe(ROS_CMD_TOPIC)
         client.subscribe(WAYPOINT_NAV_TOPIC)
-        self.get_logger().info(f"   Subscribed to: {ROS_CMD_TOPIC}, {WAYPOINT_NAV_TOPIC}")
+        client.subscribe(NAV2_RELATIVE_MOVE_TOPIC)  # Nav2-based relative movements
+        self.get_logger().info(f"   Subscribed to: {ROS_CMD_TOPIC}, {WAYPOINT_NAV_TOPIC}, {NAV2_RELATIVE_MOVE_TOPIC}")
     
     def on_mqtt_message(self, client, userdata, msg):
         """
@@ -197,8 +219,13 @@ class MqttRosBridge(Node):
             self.get_logger().info(f"📨 Received on {msg.topic}")
             
             if msg.topic == ROS_CMD_TOPIC:
-                # Low-level movement command
+                # Low-level movement command (direct velocity - NO obstacle avoidance!)
+                self.get_logger().warn("⚠️ Using direct velocity mode - NO obstacle detection!")
                 self._handle_ros_command(payload)
+            
+            elif msg.topic == NAV2_RELATIVE_MOVE_TOPIC:
+                # Nav2-based relative movements (obstacle-aware!)
+                self._handle_nav2_relative_move(payload)
             
             elif msg.topic == WAYPOINT_NAV_TOPIC:
                 # High-level waypoint navigation
@@ -416,6 +443,481 @@ class MqttRosBridge(Node):
                 "waypoint": waypoint,
                 "reason": str(e)
             }))
+    
+    def _handle_nav2_relative_move(self, payload: dict):
+        """
+        Handle Nav2-based relative movement commands (obstacle-aware!).
+        
+        Calculates a target pose relative to current robot position,
+        then uses Nav2's NavigateToPose for obstacle-aware navigation.
+        
+        Expected message format:
+        {
+            "command": "move_forward",           # Command name for logging
+            "type": "linear" | "rotation" | "stop",
+            "direction": 1 | -1,                 # Forward/backward or left/right
+            "distance_meters": 1.0,              # For linear moves
+            "angle_degrees": 90.0,               # For rotations
+            "timeout_seconds": 30.0              # Navigation timeout
+        }
+        """
+        command_name = payload.get("command", "relative_move")
+        move_type = payload.get("type", "linear")
+        direction = payload.get("direction", 1)
+        distance = payload.get("distance_meters", 1.0)
+        angle_deg = payload.get("angle_degrees", 90.0)
+        timeout = payload.get("timeout_seconds", 30.0)
+        
+        self.get_logger().info(f"🧭 Nav2 Relative Move: {command_name} (type={move_type})")
+        
+        try:
+            # Handle stop command
+            if move_type == "stop":
+                self.get_logger().info("🛑 Stop requested - cancelling any active navigation")
+                if self.active_nav_goal_handle:
+                    self.active_nav_goal_handle.cancel_goal_async()
+                    self.active_nav_goal_handle = None
+                self._stop_robot()
+                self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                    "type": "command_completed",
+                    "command": "stop",
+                    "message": "Navigation cancelled and robot stopped",
+                    "timestamp": time.time()
+                }))
+                return
+            
+            # Check if we have a valid current pose
+            if not self.current_pose or self.current_pose.get("x") is None:
+                raise RuntimeError("No current pose available from AMCL - cannot calculate target")
+            
+            # Get current pose
+            current_x = self.current_pose["x"]
+            current_y = self.current_pose["y"]
+            current_theta = math.radians(self.current_pose["theta"])  # Convert to radians
+            
+            self.get_logger().info(
+                f"📍 Current pose: x={current_x:.3f}, y={current_y:.3f}, θ={math.degrees(current_theta):.1f}°"
+            )
+            
+            if move_type == "linear":
+                # Calculate target position for linear movement
+                # Move in the direction the robot is facing
+                move_distance = distance * direction  # Positive = forward, negative = backward
+                
+                target_x = current_x + move_distance * math.cos(current_theta)
+                target_y = current_y + move_distance * math.sin(current_theta)
+                target_theta = current_theta  # Maintain current orientation
+                
+                self.get_logger().info(
+                    f"🎯 Target pose: x={target_x:.3f}, y={target_y:.3f} "
+                    f"(move {abs(move_distance):.2f}m {'forward' if direction > 0 else 'backward'})"
+                )
+                
+            elif move_type == "rotation":
+                # Calculate target orientation for rotation
+                # Positive angle = CCW (left), negative = CW (right)
+                angle_rad = math.radians(angle_deg) * direction
+                target_theta = current_theta + angle_rad
+                
+                # Normalize to [-π, π]
+                while target_theta > math.pi:
+                    target_theta -= 2 * math.pi
+                while target_theta < -math.pi:
+                    target_theta += 2 * math.pi
+                
+                # Stay in place, just rotate
+                target_x = current_x
+                target_y = current_y
+                
+                self.get_logger().info(
+                    f"🔄 Target orientation: θ={math.degrees(target_theta):.1f}° "
+                    f"(rotate {angle_deg:.1f}° {'left' if direction > 0 else 'right'})"
+                )
+            else:
+                raise ValueError(f"Unknown move type: {move_type}")
+            
+            # Convert target orientation to quaternion (yaw only for 2D)
+            # q = [x, y, z, w] where for yaw-only: z = sin(θ/2), w = cos(θ/2)
+            target_z = math.sin(target_theta / 2)
+            target_w = math.cos(target_theta / 2)
+            
+            # Send acknowledgment
+            self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                "type": "nav2_relative_move_started",
+                "command": command_name,
+                "move_type": move_type,
+                "target_x": round(target_x, 3),
+                "target_y": round(target_y, 3),
+                "target_theta_deg": round(math.degrees(target_theta), 1),
+                "timestamp": time.time()
+            }))
+            
+            # Use the existing NavigateToPose method (obstacle-aware!)
+            # This runs in a thread to not block MQTT
+            threading.Thread(
+                target=self._navigate_to_relative_goal,
+                args=(target_x, target_y, target_z, target_w, command_name, timeout),
+                daemon=True
+            ).start()
+            
+        except Exception as e:
+            self.get_logger().error(f"❌ Relative move error: {e}")
+            self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                "type": "error",
+                "command": command_name,
+                "message": str(e)
+            }))
+    
+    def _navigate_to_relative_goal(self, x: float, y: float, z: float, w: float,
+                                    command_name: str, timeout: float):
+        """
+        Navigate to a relative goal using Nav2 NavigateToPose.
+        This is similar to _navigate_to_pose but with custom feedback for relative moves.
+        """
+        try:
+            # Wait for action server
+            self.get_logger().info(f"⏳ Waiting for Nav2 action server...")
+            if not self.nav_client.wait_for_server(timeout_sec=5.0):
+                raise RuntimeError("Nav2 action server not available")
+            
+            self.get_logger().info(f"✅ Nav2 server ready")
+            
+            # Create navigation goal
+            goal = NavigateToPose.Goal()
+            goal.pose.header.frame_id = "map"
+            goal.pose.header.stamp = self.get_clock().now().to_msg()
+            
+            goal.pose.pose.position.x = x
+            goal.pose.pose.position.y = y
+            goal.pose.pose.position.z = 0.0
+            
+            goal.pose.pose.orientation.x = 0.0
+            goal.pose.pose.orientation.y = 0.0
+            goal.pose.pose.orientation.z = z
+            goal.pose.pose.orientation.w = w
+            
+            self.get_logger().info(
+                f"🎯 Nav2 relative goal: x={x:.3f}, y={y:.3f}, command='{command_name}'"
+            )
+            
+            # Send goal async
+            send_goal_future = self.nav_client.send_goal_async(goal)
+            
+            # Wait for goal acceptance
+            start = time.time()
+            while not send_goal_future.done():
+                if (time.time() - start) > 10.0:
+                    raise RuntimeError("Timeout waiting for goal acceptance")
+                time.sleep(0.1)
+            
+            goal_handle = send_goal_future.result()
+            if not goal_handle.accepted:
+                raise RuntimeError("Navigation goal was rejected by Nav2")
+            
+            self.active_nav_goal_handle = goal_handle
+            self.get_logger().info(f"✅ Relative move goal accepted")
+            
+            # Wait for result
+            result_future = goal_handle.get_result_async()
+            start = time.time()
+            
+            while not result_future.done():
+                elapsed = time.time() - start
+                if elapsed > timeout:
+                    self.get_logger().warn(f"⏱️ Relative move timeout ({elapsed:.0f}s)")
+                    goal_handle.cancel_goal_async()
+                    self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                        "type": "command_timeout",
+                        "command": command_name,
+                        "elapsed_seconds": elapsed,
+                        "timestamp": time.time()
+                    }))
+                    return
+                time.sleep(0.2)
+            
+            if result_future.done():
+                result = result_future.result()
+                elapsed = time.time() - start
+                self.get_logger().info(
+                    f"🏁 Relative move complete: {command_name} in {elapsed:.1f}s"
+                )
+                
+                # Send success feedback
+                self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                    "type": "command_completed",
+                    "command": command_name,
+                    "final_pose": self.current_pose,
+                    "elapsed_seconds": round(elapsed, 2),
+                    "obstacle_aware": True,
+                    "timestamp": time.time()
+                }))
+                
+            self.active_nav_goal_handle = None
+            
+        except Exception as e:
+            self.get_logger().error(f"❌ Relative navigation failed: {e}")
+            self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                "type": "error",
+                "command": command_name,
+                "message": str(e)
+            }))
+            self.active_nav_goal_handle = None
+    
+    def _handle_nav2_behavior(self, payload: dict):
+        """
+        Handle Nav2 behavior commands (DriveOnHeading, Spin) that respect the costmap.
+        
+        These behaviors use Nav2's local planner and will stop if obstacles are detected!
+        This is MUCH safer than direct velocity commands.
+        
+        Expected message format:
+        {
+            "command": "move_forward",
+            "use_nav2_behavior": true,
+            "behavior_type": "drive_on_heading" | "spin",
+            "parameters": {
+                // For drive_on_heading:
+                "dist_to_travel": 1.0,     // meters (positive=forward, negative=backward)
+                "speed": 0.15,             // m/s
+                "time_allowance": 10.0     // seconds timeout
+                
+                // For spin:
+                "target_yaw": 1.57,        // radians (positive=CCW/left, negative=CW/right)
+                "spin_speed": 0.3,         // rad/s
+                "time_allowance": 10.0     // seconds timeout
+            }
+        }
+        """
+        command_name = payload.get('command', 'unknown')
+        behavior_type = payload.get('behavior_type', '').lower()
+        params = payload.get('parameters', {})
+        
+        self.get_logger().info(f"🔄 Nav2 Behavior: {behavior_type} for '{command_name}'")
+        
+        try:
+            # Send acknowledgment
+            self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                "type": "command_received",
+                "command": command_name,
+                "behavior_type": behavior_type,
+                "obstacle_aware": True,
+                "timestamp": time.time()
+            }))
+            
+            if behavior_type == "drive_on_heading":
+                # Execute DriveOnHeading behavior
+                threading.Thread(
+                    target=self._execute_drive_on_heading,
+                    args=(
+                        float(params.get('dist_to_travel', 0.5)),
+                        float(params.get('speed', 0.15)),
+                        float(params.get('time_allowance', 10.0)),
+                        command_name
+                    ),
+                    daemon=True
+                ).start()
+                
+            elif behavior_type == "spin":
+                # Execute Spin behavior
+                threading.Thread(
+                    target=self._execute_spin,
+                    args=(
+                        float(params.get('target_yaw', 0.785)),  # ~45 degrees
+                        float(params.get('spin_speed', 0.3)),
+                        float(params.get('time_allowance', 10.0)),
+                        command_name
+                    ),
+                    daemon=True
+                ).start()
+            
+            else:
+                self.get_logger().warn(f"⚠️ Unknown behavior type: {behavior_type}")
+                self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                    "type": "error",
+                    "message": f"Unknown behavior type: {behavior_type}"
+                }))
+                
+        except Exception as e:
+            self.get_logger().error(f"❌ Nav2 behavior error: {e}")
+            self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                "type": "error",
+                "message": str(e)
+            }))
+    
+    def _execute_drive_on_heading(self, distance: float, speed: float, 
+                                  timeout: float, command_name: str):
+        """
+        Execute DriveOnHeading behavior - moves in a straight line while
+        respecting the costmap (stops if obstacle detected).
+        
+        Args:
+            distance: Distance to travel in meters (positive=forward, negative=backward)
+            speed: Speed in m/s
+            timeout: Maximum time allowed in seconds
+            command_name: Name for feedback
+        """
+        try:
+            # Wait for action server
+            if not self.drive_on_heading_client.wait_for_server(timeout_sec=5.0):
+                raise RuntimeError("DriveOnHeading action server not available")
+            
+            # Clamp speed to safety limits
+            speed = min(abs(speed), MAX_LINEAR_VELOCITY)
+            
+            # Create goal
+            goal = DriveOnHeading.Goal()
+            goal.target.x = distance  # Positive = forward
+            goal.speed = speed
+            goal.time_allowance.sec = int(timeout)
+            goal.time_allowance.nanosec = int((timeout - int(timeout)) * 1e9)
+            
+            self.get_logger().info(
+                f"🚗 DriveOnHeading: {distance:.2f}m at {speed:.2f}m/s "
+                f"(timeout={timeout:.1f}s, obstacle-aware)"
+            )
+            
+            # Send goal
+            send_goal_future = self.drive_on_heading_client.send_goal_async(goal)
+            
+            # Wait for acceptance
+            start = time.time()
+            while not send_goal_future.done():
+                if (time.time() - start) > 5.0:
+                    raise RuntimeError("Timeout waiting for goal acceptance")
+                time.sleep(0.1)
+            
+            goal_handle = send_goal_future.result()
+            if not goal_handle.accepted:
+                raise RuntimeError("DriveOnHeading goal was rejected")
+            
+            self.get_logger().info("✅ DriveOnHeading goal accepted")
+            
+            # Wait for result
+            result_future = goal_handle.get_result_async()
+            start = time.time()
+            
+            while not result_future.done():
+                if (time.time() - start) > timeout + 5:
+                    self.get_logger().warn("⏱️ DriveOnHeading timeout - cancelling")
+                    goal_handle.cancel_goal_async()
+                    break
+                time.sleep(0.1)
+            
+            if result_future.done():
+                result = result_future.result()
+                actual_distance = result.result.total_elapsed_time.sec + \
+                                 result.result.total_elapsed_time.nanosec / 1e9
+                self.get_logger().info(
+                    f"✅ DriveOnHeading complete: {command_name} in {actual_distance:.2f}s"
+                )
+                
+                self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                    "type": "command_completed",
+                    "command": command_name,
+                    "behavior_type": "drive_on_heading",
+                    "requested_distance": distance,
+                    "obstacle_aware": True,
+                    "timestamp": time.time()
+                }))
+            
+        except Exception as e:
+            self.get_logger().error(f"❌ DriveOnHeading failed: {e}")
+            self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                "type": "error",
+                "command": command_name,
+                "message": str(e)
+            }))
+            # Ensure robot is stopped
+            self._stop_robot()
+    
+    def _execute_spin(self, target_yaw: float, spin_speed: float, 
+                      timeout: float, command_name: str):
+        """
+        Execute Spin behavior - rotates in place while respecting the costmap.
+        
+        Args:
+            target_yaw: Target rotation in radians (positive=CCW/left, negative=CW/right)
+            spin_speed: Angular speed in rad/s
+            timeout: Maximum time allowed in seconds
+            command_name: Name for feedback
+        """
+        try:
+            # Wait for action server
+            if not self.spin_client.wait_for_server(timeout_sec=5.0):
+                raise RuntimeError("Spin action server not available")
+            
+            # Clamp speed to safety limits
+            spin_speed = min(abs(spin_speed), MAX_ANGULAR_VELOCITY)
+            
+            # Create goal
+            goal = Spin.Goal()
+            goal.target_yaw = target_yaw
+            goal.spin_dist = abs(target_yaw)  # Total spin distance
+            goal.time_allowance.sec = int(timeout)
+            goal.time_allowance.nanosec = int((timeout - int(timeout)) * 1e9)
+            
+            angle_deg = math.degrees(abs(target_yaw))
+            direction = "left" if target_yaw > 0 else "right"
+            
+            self.get_logger().info(
+                f"🔄 Spin: {angle_deg:.1f}° {direction} at {spin_speed:.2f}rad/s "
+                f"(timeout={timeout:.1f}s, obstacle-aware)"
+            )
+            
+            # Send goal
+            send_goal_future = self.spin_client.send_goal_async(goal)
+            
+            # Wait for acceptance
+            start = time.time()
+            while not send_goal_future.done():
+                if (time.time() - start) > 5.0:
+                    raise RuntimeError("Timeout waiting for goal acceptance")
+                time.sleep(0.1)
+            
+            goal_handle = send_goal_future.result()
+            if not goal_handle.accepted:
+                raise RuntimeError("Spin goal was rejected")
+            
+            self.get_logger().info("✅ Spin goal accepted")
+            
+            # Wait for result
+            result_future = goal_handle.get_result_async()
+            start = time.time()
+            
+            while not result_future.done():
+                if (time.time() - start) > timeout + 5:
+                    self.get_logger().warn("⏱️ Spin timeout - cancelling")
+                    goal_handle.cancel_goal_async()
+                    break
+                time.sleep(0.1)
+            
+            if result_future.done():
+                result = result_future.result()
+                actual_time = result.result.total_elapsed_time.sec + \
+                             result.result.total_elapsed_time.nanosec / 1e9
+                self.get_logger().info(
+                    f"✅ Spin complete: {command_name} in {actual_time:.2f}s"
+                )
+                
+                self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                    "type": "command_completed",
+                    "command": command_name,
+                    "behavior_type": "spin",
+                    "requested_yaw_rad": target_yaw,
+                    "requested_yaw_deg": angle_deg,
+                    "obstacle_aware": True,
+                    "timestamp": time.time()
+                }))
+            
+        except Exception as e:
+            self.get_logger().error(f"❌ Spin failed: {e}")
+            self.mqtt_client.publish(ROS_FEEDBACK_TOPIC, json.dumps({
+                "type": "error",
+                "command": command_name,
+                "message": str(e)
+            }))
+            # Ensure robot is stopped
+            self._stop_robot()
     
     # =====================================================================
     # MOVEMENT EXECUTION
