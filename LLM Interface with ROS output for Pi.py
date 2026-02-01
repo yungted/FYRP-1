@@ -109,8 +109,8 @@ emergency_stop_active = False
 # ----------------------------
 # GLOBAL OBJECTS
 # ----------------------------
-print("⏳ Loading TTS Model (this may take a moment)...")
-tts_engine = TTS("tts_models/en/ljspeech/vits")
+print("⏳ Loading TTS Model (Glow-TTS - optimized for speed)...")
+tts_engine = TTS("tts_models/en/ljspeech/glow-tts", gpu=False)  # Set gpu=True if you have CUDA
 print("✅ TTS Model Loaded.")
 
 mqtt_client = mqtt.Client(client_id="pc-llm-client")
@@ -1456,8 +1456,8 @@ async def deepgram_loop():
                     is_awake = True
                     command_buffer = ""
                     print("🟢 Wake word detected!")
-                    # Acknowledge via buzzer (best-effort)
-                    publish_control_message({"device": "buzzer", "action": "beep"})
+                    # Acknowledge via TTS (verbal confirmation)
+                    await speak("Yes?")
                     continue
 
                 # Capture command while awake
